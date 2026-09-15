@@ -73,17 +73,24 @@ STEP_NAME="agentx_server_${SLURM_JOB_ID}_$$"
 SERVER_PID=
 finish() {
     local result=$?
+    # While holding, a signal requests release through this same cleanup path.
+    # Do not exit from a signal handler after removing the EXIT trap.
+    trap 'result=130; HOLD_AFTER_RUN=0' INT
+    trap 'result=143; HOLD_AFTER_RUN=0' TERM
     trap - EXIT
     printf '%s\n' "$result" > "$RUN_ROOT/client-exit-code.txt"
     if [[ "$HOLD_AFTER_RUN" = 1 && -n "$SERVER_PID" ]]; then
         echo 'Holding allocation; touch RUN_ROOT/release-requested to release' > "$RUN_ROOT/allocation-held.txt"
-        while [[ ! -f "$RUN_ROOT/release-requested" ]] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 5; done
+        while [[ "$HOLD_AFTER_RUN" = 1 && ! -f "$RUN_ROOT/release-requested" ]] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 5 || true; done
     fi
+    # Finish the owned-step cleanup even if a second signal arrives.
+    trap '' INT TERM
     # Restrict cleanup to the unique step this invocation started.
     while read -r step name; do
         if [[ "$name" = "$STEP_NAME" ]]; then scancel "$step" || true; fi
     done < <(squeue -h -s -j "$SLURM_JOB_ID" -o '%i %j')
     if [[ -n "$SERVER_PID" ]]; then wait "$SERVER_PID" 2>/dev/null || true; fi
+    printf '%s\n' "$result" > "$RUN_ROOT/client-exit-code.txt"
     exit "$result"
 }
 trap finish EXIT

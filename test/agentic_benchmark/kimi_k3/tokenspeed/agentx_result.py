@@ -38,12 +38,30 @@ def file_sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def server_configuration(environment):
+    # Record choices without imposing a particular custom launcher's environment.
+    # Revisions are caller-provided identifiers, not verified weight hashes.
+    return {
+        name: environment.get(name)
+        for name in (
+            "MODEL_DIR",
+            "DRAFT_DIR",
+            "SERVER_VENV",
+            "GPU_MEMORY_UTILIZATION",
+            "SERVER_SEED",
+            "MODEL_REVISION",
+            "DRAFT_REVISION",
+        )
+    }
+
+
 def prepare(run_root):
     from evalscope.perf.scenarios.agentx import AgentXScenario
 
     scenario = AgentXScenario.model_validate_json(
         (run_root / "scenario.json").read_text()
     )
+    server = server_configuration(os.environ)
     duration = int(os.environ["DURATION"])
     if scenario.mode == "benchmark" and duration < 900:
         raise ValueError("Benchmark duration must be >=900 seconds")
@@ -81,6 +99,7 @@ def prepare(run_root):
     manifest = {
         "environment": environment,
         "scenario": scenario.model_dump(),
+        "server_configuration": server,
         "harness_commit": commit,
         "harness_sha256": file_sha256(Path(__file__).with_name("agentx.slurm")),
         "server_script_sha256": file_sha256(Path(environment["SERVER_SCRIPT"])),

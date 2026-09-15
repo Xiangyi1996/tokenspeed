@@ -24,6 +24,7 @@ import copy
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -36,6 +37,41 @@ SPEC = importlib.util.spec_from_file_location(
 )
 RESULT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RESULT)
+
+
+class ManifestTest(unittest.TestCase):
+    def test_server_parameters_are_recorded_without_mandating_a_launcher(self):
+        environment = dict(
+            MODEL_DIR="/models/target",
+            DRAFT_DIR="/models/draft",
+            MODEL_REVISION="target-revision",
+            DRAFT_REVISION="draft-revision",
+            SERVER_VENV="/opt/server-venv",
+            GPU_MEMORY_UTILIZATION="0.9",
+            SERVER_SEED="7",
+        )
+        baseline = RESULT.server_configuration(environment)
+        self.assertEqual(baseline, environment)
+        for field, changed in (
+            ("MODEL_DIR", "/models/other-target"),
+            ("DRAFT_DIR", "/models/other-draft"),
+            ("MODEL_REVISION", "other-target-revision"),
+            ("DRAFT_REVISION", "other-draft-revision"),
+            ("SERVER_SEED", "8"),
+            ("GPU_MEMORY_UTILIZATION", "0.8"),
+            ("SERVER_VENV", ""),
+        ):
+            with self.subTest(field=field):
+                updated = RESULT.server_configuration(
+                    dict(environment, **{field: changed})
+                )
+                self.assertNotEqual(baseline, updated)
+                self.assertEqual(updated[field], changed)
+        for field in environment:
+            with self.subTest(missing=field):
+                incomplete = dict(environment)
+                del incomplete[field]
+                self.assertIsNone(RESULT.server_configuration(incomplete)[field])
 
 
 class ResultTest(unittest.TestCase):
@@ -98,6 +134,8 @@ class LifecycleTest(unittest.TestCase):
             "client_failure",
             "hold",
             "hold_marker",
+            "hold_sigterm",
+            "hold_sigint",
             "occupied",
             "startup_failure",
         ):
@@ -162,7 +200,9 @@ fi""",
                     READINESS_PATH="/readiness",
                     READINESS_TIMEOUT="1",
                     CLIENT_TIMEOUT="90",
-                    HOLD_AFTER_RUN="1" if case == "hold" else "0",
+                    HOLD_AFTER_RUN=(
+                        "1" if case in ("hold", "hold_sigterm", "hold_sigint") else "0"
+                    ),
                     RUN_ROOT=str(run),
                 )
                 process = subprocess.Popen(
@@ -173,7 +213,7 @@ fi""",
                     text=True,
                 )
                 try:
-                    if case in ("hold", "hold_marker"):
+                    if case.startswith("hold"):
                         deadline = time.monotonic() + 5
                         while (
                             not (run / "allocation-held.txt").exists()
@@ -182,13 +222,26 @@ fi""",
                             time.sleep(0.05)
                         self.assertTrue((run / "allocation-held.txt").exists())
                         self.assertIsNone(process.poll())
-                        (run / "release-requested").touch()
+                        if case in ("hold_sigterm", "hold_sigint"):
+                            process.send_signal(
+                                signal.SIGTERM
+                                if case == "hold_sigterm"
+                                else signal.SIGINT
+                            )
+                        else:
+                            (run / "release-requested").touch()
                     stdout, stderr = process.communicate(timeout=8)
                     self.assertEqual(
                         process.returncode == 0,
                         case in ("success", "hold", "hold_marker"),
                         stderr,
                     )
+                    if case in ("hold_sigterm", "hold_sigint"):
+                        expected = 143 if case == "hold_sigterm" else 130
+                        self.assertEqual(process.returncode, expected)
+                        self.assertEqual(
+                            int((run / "client-exit-code.txt").read_text()), expected
+                        )
                     if case == "occupied":
                         self.assertFalse((root / "step").exists())
                     else:
@@ -201,6 +254,14 @@ fi""",
                     if process.poll() is None:
                         process.terminate()
                         process.communicate(timeout=5)
+                    # Also reap the fake server if the behavior under test leaked it.
+                    if (root / "server-pid").exists():
+                        try:
+                            os.kill(
+                                int((root / "server-pid").read_text()), signal.SIGTERM
+                            )
+                        except ProcessLookupError:
+                            pass
 
 
 if __name__ == "__main__":
