@@ -52,6 +52,7 @@ class ManifestTest(unittest.TestCase):
                 "agentx.slurm",
                 "harness.slurm",
                 "server.sh",
+                "source-server.sh",
                 "traces.jsonl",
                 "dataset/traces.jsonl",
                 "adapter.py",
@@ -81,7 +82,7 @@ class ManifestTest(unittest.TestCase):
             )
             environment.update(
                 SOURCE_ROOT=str(root),
-                SERVER_SCRIPT=str(root / "server.sh"),
+                SERVER_SCRIPT=str(root / "source-server.sh"),
                 DATASET_PATH=str(root),
                 DURATION="60",
                 CLIENT_TIMEOUT="120",
@@ -120,6 +121,12 @@ class ManifestTest(unittest.TestCase):
                     before["harness_sha256"],
                     hashlib.sha256((root / "agentx.slurm").read_bytes()).hexdigest(),
                 )
+                self.assertEqual(
+                    before["server_script_sha256"],
+                    hashlib.sha256((root / "server.sh").read_bytes()).hexdigest(),
+                )
+                self.assertEqual(before["server_script_path"], str(root / "server.sh"))
+                (root / "source-server.sh").write_text("Changed server source")
                 (root / "agentx.slurm").write_text("Changed checkout after submission")
                 self.assertEqual(
                     before["dataset_sha256"],
@@ -139,6 +146,9 @@ class ManifestTest(unittest.TestCase):
                     stream.write("\n# Local auditor modification without a commit.\n")
                 RESULT.prepare(root)
                 after = json.loads((root / "manifest.json").read_text())
+                self.assertEqual(
+                    before["server_script_sha256"], after["server_script_sha256"]
+                )
                 (root / "harness.slurm").write_text("Different executed script")
                 RESULT.prepare(root)
                 different_launcher = json.loads((root / "manifest.json").read_text())
@@ -252,6 +262,10 @@ class LifecycleTest(unittest.TestCase):
             "spool_copy",
             "dataset_replaced",
             "auditor_replaced",
+            "server_replaced",
+            "copy_sigterm",
+            "copy_sigint",
+            "copy_failure",
             "prepare_sigterm",
             "prepare_sigint",
             "prepare_failure",
@@ -280,6 +294,13 @@ class LifecycleTest(unittest.TestCase):
                 binaries = root / "bin"
                 binaries.mkdir()
                 scripts = {
+                    "cp": '''if [ "$2" = "$DATASET_PATH/traces.jsonl" ]; then
+case "$CASE" in
+copy_sigterm|copy_sigint) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" copy ;;
+copy_failure) exit 29 ;;
+esac
+fi
+exec /bin/cp "$@"''',
                     "squeue": """case "$*" in
 *"%u"*) id -un ;;
 *"%T"*) echo RUNNING ;;
@@ -289,6 +310,8 @@ esac""",
                     "scontrol": """if [ "$1" = show ] && [ "$2" = hostnames ]; then echo testnode; else echo allocation; fi""",
                     "srun": """for arg in "$@"; do
 case "$arg" in --job-name=*)
+printf '%s' "${@: -1}" > "$TEST_ROOT/server-script-path"
+/bin/cp "${@: -1}" "$TEST_ROOT/executed-server"
 case "$CASE" in startup_sigterm|startup_sigint|startup_timeout) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" "${arg#--job-name=}" ;; esac
 echo "123.1 ${arg#--job-name=}" > "$TEST_ROOT/step"; echo $$ > "$TEST_ROOT/server-pid"; exec /usr/bin/sleep 30 ;; esac
 done
@@ -296,6 +319,7 @@ case "$CASE" in
 preflight_sigterm|preflight_sigint) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" ;;
 preflight_failure) exit 23 ;;
 dataset_replaced) echo "Replaced shared trace" > "$DATASET_PATH/traces.jsonl" ;;
+server_replaced) echo "Changed server source" > "$SERVER_SCRIPT" ;;
 esac
 exit 0""",
                     "scancel": '''echo "$*" >> "$TEST_ROOT/cancelled"
@@ -369,7 +393,7 @@ from pathlib import Path
 
 root = Path(os.environ["TEST_ROOT"])
 role = "server" if len(sys.argv) > 1 else "preflight"
-if len(sys.argv) > 1 and sys.argv[1] in ("prepare", "audit"):
+if len(sys.argv) > 1 and sys.argv[1] in ("prepare", "audit", "copy"):
     role = sys.argv[1]
 
 def stop(signum, frame):
@@ -447,6 +471,9 @@ while True:
                             "preflight_sigterm",
                             "preflight_sigint",
                             "preflight_failure",
+                            "copy_sigterm",
+                            "copy_sigint",
+                            "copy_failure",
                             "prepare_sigterm",
                             "prepare_sigint",
                             "prepare_failure",
@@ -474,6 +501,8 @@ while True:
                 )
                 try:
                     if case in (
+                        "copy_sigterm",
+                        "copy_sigint",
                         "prepare_sigterm",
                         "prepare_sigint",
                         "audit_sigterm",
@@ -558,6 +587,7 @@ while True:
                             "spool_copy",
                             "dataset_replaced",
                             "auditor_replaced",
+                            "server_replaced",
                             "hold",
                             "hold_marker",
                         ),
@@ -603,7 +633,7 @@ while True:
                         self.assertFalse((root / "cancelled").exists())
                         self.assertFalse((root / "client-called").exists())
                         self.assertFalse((run / "allocation-held.txt").exists())
-                    elif case.startswith("prepare"):
+                    elif case.startswith(("prepare", "copy")):
                         self.assertFalse((root / "server-pid").exists())
                         self.assertFalse((root / "step").exists())
                         self.assertFalse((root / "cancelled").exists())
@@ -633,7 +663,7 @@ while True:
                             (root / "cancelled").read_text().splitlines(), ["123.1"]
                         )
                     if (
-                        case.startswith(("prepare", "audit"))
+                        case.startswith(("prepare", "audit", "copy"))
                         and case != "auditor_replaced"
                     ):
                         role = case.split("_")[0]
@@ -668,6 +698,20 @@ while True:
                             source_auditor.read_bytes(),
                             (root / "audit-auditor").read_bytes(),
                         )
+                    if (root / "server-script-path").exists():
+                        self.assertEqual(
+                            (root / "server-script-path").read_text(),
+                            str(run / "server.sh"),
+                        )
+                        self.assertEqual(
+                            (root / "executed-server").read_bytes(),
+                            (run / "server.sh").read_bytes(),
+                        )
+                        if case == "server_replaced":
+                            self.assertNotEqual(
+                                server.read_bytes(),
+                                (root / "executed-server").read_bytes(),
+                            )
                     self.assertEqual(
                         (run / "harness.slurm").read_bytes(),
                         executing_script.read_bytes(),
@@ -713,7 +757,7 @@ while True:
                         process.kill()
                         process.communicate(timeout=5)
                     # Also reap the fake server if the behavior under test leaked it.
-                    for role in ("server", "preflight", "prepare", "audit"):
+                    for role in ("server", "preflight", "prepare", "audit", "copy"):
                         if (root / (role + "-pid")).exists():
                             try:
                                 os.kill(

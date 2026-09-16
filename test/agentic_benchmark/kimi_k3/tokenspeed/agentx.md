@@ -121,13 +121,14 @@ failure, until `touch "$RUN_ROOT/release-requested"`, server exit or allocation
 expiry. SIGINT/SIGTERM stops the invocation's server step. With `HOLD_AFTER_RUN=0`,
 only that step is stopped after the run; an independently held allocation survives.
 A directly submitted batch allocation ends when its batch script exits.
-A signal received during manifest preparation, GPU preflight, server startup,
+A signal received during snapshot copying, manifest preparation, GPU preflight, server startup,
 client execution, result auditing or hold
 exits with 130 (SIGINT) or 143 (SIGTERM) and records that code. The preflight runs
 as a tracked background child; cancellation terminates and reaps its `srun` before
 exiting. Preflight failure preserves its exit code and prevents server/client launch.
-Manifest preparation and result auditing also run as tracked children. Cancellation
-terminates and reaps them before server cleanup; preparation failure prevents launch.
+Snapshot copies, manifest preparation and result auditing share a tracked-child
+execution path. Signal handlers are installed before copying inputs. Cancellation
+terminates and reaps them before server cleanup; copy or preparation failure prevents launch and preserves its exit code.
 During a client run, the harness forwards
 the signal through GNU `timeout` to the client's process group and waits for it
 to exit before cleaning up its own server step. An unresponsive client is killed
@@ -190,6 +191,11 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
 - `allocation.txt`, `gpu-preflight.log`, `server.log`: allocation and server evidence.
 - `harness.slurm`: executing launcher snapshot corresponding to `harness_sha256`.
 - `agentx_result.py`: auditor snapshot corresponding to `auditor_sha256`.
+- `server.sh`: launcher snapshot executed in the container and identified by
+  `server_script_sha256` and `server_script_path`. `environment.SERVER_SCRIPT`
+  retains the original path. Custom launchers must resolve assets through absolute
+  paths or `SOURCE_ROOT`, since their script location is now `RUN_ROOT`; the container working directory
+  remains `SOURCE_ROOT`.
 - `dataset/traces.jsonl`: client input snapshot corresponding to `dataset_sha256`.
   The manifest's `dataset_path` identifies the consumed directory;
   `environment.DATASET_PATH` retains the original source directory.
@@ -223,7 +229,9 @@ from a spool copy that differs from the checkout, and replacement of the shared
 dataset after preparation without changing the client's snapshot. Auditor checkout
 replacement leaves preparation and auditing on the same snapshot. Preparation and
 audit failures and SIGINT/SIGTERM cancellation preserve exit codes and reap tracked
-children. No GPU allocation is created.
+children. Snapshot-copy cancellation and failure prevent server launch; replacing
+the server source during preflight leaves the executed launcher snapshot unchanged.
+No GPU allocation is created.
 
 
 ## Drain time

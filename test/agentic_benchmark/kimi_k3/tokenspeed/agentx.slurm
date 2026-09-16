@@ -56,18 +56,12 @@ SCRIPT_DIR="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed"
 [[ "$(squeue -h -j "$SLURM_JOB_ID" -o '%T')" = RUNNING ]] || { echo 'Allocation must be RUNNING' >&2; exit 1; }
 # Atomic reservation: never overwrite evidence or run the same output twice.
 mkdir "$RUN_ROOT"
-# sbatch executes a spool copy that can differ from the current checkout.
-cp -- "${BASH_SOURCE[0]}" "$RUN_ROOT/harness.slurm"
-cp "$SCENARIO_FILE" "$RUN_ROOT/scenario.json"
-mkdir "$RUN_ROOT/dataset"
-cp -- "$DATASET_PATH/traces.jsonl" "$RUN_ROOT/dataset/traces.jsonl"
-cp -- "$SCRIPT_DIR/agentx_result.py" "$RUN_ROOT/agentx_result.py"
 export NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 STEP_NAME="agentx_server_${SLURM_JOB_ID}_$$"
 SERVER_PID=
 PREFLIGHT_PID=
 CLIENT_PID=
-AUDITOR_PID=
+HELPER_PID=
 CLIENT_SIGNAL=TERM
 finish() {
     local result=$?
@@ -85,10 +79,10 @@ finish() {
         wait "$PREFLIGHT_PID" 2>/dev/null || true
         PREFLIGHT_PID=
     fi
-    if [[ -n "$AUDITOR_PID" ]]; then
-        kill -TERM "$AUDITOR_PID" 2>/dev/null || true
-        wait "$AUDITOR_PID" 2>/dev/null || true
-        AUDITOR_PID=
+    if [[ -n "$HELPER_PID" ]]; then
+        kill -TERM "$HELPER_PID" 2>/dev/null || true
+        wait "$HELPER_PID" 2>/dev/null || true
+        HELPER_PID=
     fi
     # While holding, a signal requests release through this same cleanup path.
     # Do not exit from a signal handler after removing the EXIT trap.
@@ -117,15 +111,22 @@ finish() {
 trap finish EXIT
 trap 'HOLD_AFTER_RUN=0; CLIENT_SIGNAL=INT; exit 130' INT
 trap 'HOLD_AFTER_RUN=0; CLIENT_SIGNAL=TERM; exit 143' TERM
-run_auditor() {
-    local auditor_result=0
-    "$CLIENT_PYTHON" "$RUN_ROOT/agentx_result.py" "$1" "$RUN_ROOT" &
-    AUDITOR_PID=$!
-    wait "$AUDITOR_PID" || auditor_result=$?
-    AUDITOR_PID=
-    return "$auditor_result"
+run_tracked() {
+    local helper_result=0
+    "$@" &
+    HELPER_PID=$!
+    wait "$HELPER_PID" || helper_result=$?
+    HELPER_PID=
+    return "$helper_result"
 }
-run_auditor prepare
+# sbatch executes a spool copy that can differ from the current checkout.
+run_tracked cp -- "${BASH_SOURCE[0]}" "$RUN_ROOT/harness.slurm"
+run_tracked cp "$SCENARIO_FILE" "$RUN_ROOT/scenario.json"
+mkdir "$RUN_ROOT/dataset"
+run_tracked cp -- "$DATASET_PATH/traces.jsonl" "$RUN_ROOT/dataset/traces.jsonl"
+run_tracked cp -- "$SCRIPT_DIR/agentx_result.py" "$RUN_ROOT/agentx_result.py"
+run_tracked cp -- "$SERVER_SCRIPT" "$RUN_ROOT/server.sh"
+run_tracked "$CLIENT_PYTHON" "$RUN_ROOT/agentx_result.py" prepare "$RUN_ROOT"
 scontrol show job "$SLURM_JOB_ID" > "$RUN_ROOT/allocation.txt"
 mapfile -t NODES < <(scontrol show hostnames "$(squeue -h -j "$SLURM_JOB_ID" -o '%N')")
 [[ "${#NODES[@]}" -gt 0 ]]
@@ -152,7 +153,7 @@ wait "$PREFLIGHT_PID" || PREFLIGHT_RESULT=$?
 PREFLIGHT_PID=
 if (( PREFLIGHT_RESULT != 0 )); then exit "$PREFLIGHT_RESULT"; fi
 "${SRUN[@]}" --job-name="$STEP_NAME" --mpi=pmix --kill-on-bad-exit=1 \
-    bash "$SERVER_SCRIPT" > "$RUN_ROOT/server.log" 2>&1 &
+    bash "$RUN_ROOT/server.sh" > "$RUN_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 START=$SECONDS
 until curl --fail --silent --max-time 5 --output /dev/null "$BASE_URL$READINESS_PATH"; do
@@ -177,7 +178,7 @@ CLIENT_RESULT=0
 wait "$CLIENT_PID" || CLIENT_RESULT=$?
 CLIENT_PID=
 if (( CLIENT_RESULT != 0 )); then exit "$CLIENT_RESULT"; fi
-run_auditor audit
+run_tracked "$CLIENT_PYTHON" "$RUN_ROOT/agentx_result.py" audit "$RUN_ROOT"
 
 # A controller may retain a successful service for additional client runs.
 if [[ -f "$RUN_ROOT/hold-after-client" ]]; then HOLD_AFTER_RUN=1; fi
