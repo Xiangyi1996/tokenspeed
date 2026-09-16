@@ -200,7 +200,11 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
   The manifest's `dataset_path` identifies the consumed directory;
   `environment.DATASET_PATH` retains the original source directory.
 - `client/`: EvalScope summaries, AIPerf raw summary, JSONL and phase logs.
-- `audit.json`: successful, cancelled and errored profiling counts.
+- `audit.json`: successful, cancelled and errored profiling counts. Validation or
+  artifact-read failures write `status: rejected`, `reason`, and `error_type` before
+  exiting nonzero. Counts come from the final phase log; missing or ambiguous
+  phase counts remain null, with all parsed matches in `profiling_phase_counts`.
+  A failed client command exits before auditing; its raw logs and exit code remain.
 - `client-exit-code.txt`: command/audit outcome; inspect `audit.json` as well.
 
 AIPerf may omit `error_request_count` when zero and omit cancelled requests from

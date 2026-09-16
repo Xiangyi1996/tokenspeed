@@ -230,6 +230,8 @@ class ResultTest(unittest.TestCase):
             "missing_phase",
             "grace_timeout",
             "count_mismatch",
+            "summary_error",
+            "phase_error",
         ):
             with self.subTest(case=case):
                 s, rows = copy.deepcopy(summary), copy.deepcopy(records)
@@ -246,6 +248,10 @@ class ResultTest(unittest.TestCase):
                     log += " | elapsed=2400.00s | grace_period_timeout=True"
                 elif case == "missing_phase":
                     log = ""
+                elif case == "summary_error":
+                    s["error_summary"] = ["failed request"]
+                elif case == "phase_error":
+                    log = log.replace("errors=0", "errors=1")
                 elif case == "count_mismatch":
                     s["metrics"]["request_count"]["avg"] = 2
                 if case in ("success", "hidden_cancel_benchmark"):
@@ -253,6 +259,82 @@ class ResultTest(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         RESULT.audit(s, rows, log)
+                with tempfile.TemporaryDirectory() as directory:
+                    run = Path(directory)
+                    artifact = run / "client/run/aiperf"
+                    (artifact / "logs").mkdir(parents=True)
+                    (artifact.parent / "agentx_summary.json").write_text(json.dumps(s))
+                    (artifact / "profile_export.jsonl").write_text(
+                        "\n".join(json.dumps(row) for row in rows)
+                    )
+                    (artifact / "logs/aiperf.log").write_text(log)
+                    process = subprocess.run(
+                        [
+                            sys.executable,
+                            str(ROOT / "agentx_result.py"),
+                            "audit",
+                            str(run),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    result = json.loads((run / "audit.json").read_text())
+                    accepted = case in ("success", "hidden_cancel_benchmark")
+                    self.assertEqual(process.returncode == 0, accepted, process.stderr)
+                    if not accepted:
+                        self.assertEqual(result["status"], "rejected")
+                        self.assertTrue(result["reason"])
+                        self.assertEqual(result["error_type"], "ValueError")
+                        self.assertEqual(
+                            result["cancelled"],
+                            None if case == "missing_phase" else cancelled,
+                        )
+                        self.assertEqual(
+                            result["errors"],
+                            (
+                                None
+                                if case == "missing_phase"
+                                else int(case == "phase_error")
+                            ),
+                        )
+
+    def test_missing_or_invalid_artifacts_leave_failure_record(self):
+        for case in (
+            "missing_summary",
+            "invalid_summary",
+            "invalid_export",
+            "ambiguous_phases",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                run = Path(directory)
+                if case != "missing_summary":
+                    artifact = run / "client/run/aiperf"
+                    (artifact / "logs").mkdir(parents=True)
+                    (artifact.parent / "agentx_summary.json").write_text("invalid")
+                    log = "Phase profiling (profiling) complete | completed=1, cancelled=2, errors=3"
+                    if case == "ambiguous_phases":
+                        log += "\n" + log
+                    (artifact / "logs/aiperf.log").write_text(log)
+                    if case == "invalid_export":
+                        (artifact.parent / "agentx_summary.json").write_text("{}")
+                        (artifact / "profile_export.jsonl").write_text("invalid")
+                with self.assertRaises(ValueError):
+                    RESULT.main("audit", run)
+                result = json.loads((run / "audit.json").read_text())
+                self.assertEqual(result["status"], "rejected")
+                self.assertTrue(result["reason"])
+                if case in ("missing_summary", "ambiguous_phases"):
+                    self.assertIsNone(result["completed"])
+                    self.assertEqual(
+                        len(result["profiling_phase_counts"]),
+                        0 if case == "missing_summary" else 2,
+                    )
+                else:
+                    self.assertEqual(
+                        (result["completed"], result["cancelled"], result["errors"]),
+                        (1, 2, 3),
+                    )
 
 
 class LifecycleTest(unittest.TestCase):

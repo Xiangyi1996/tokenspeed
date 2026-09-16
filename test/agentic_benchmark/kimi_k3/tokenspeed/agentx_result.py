@@ -123,6 +123,16 @@ def prepare(run_root):
     (run_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+def profiling_counts(log_text):
+    return [
+        dict(zip(("completed", "cancelled", "errors"), map(int, counts)))
+        for counts in re.findall(
+            r"Phase profiling \(profiling\) complete \| completed=(\d+), cancelled=(\d+), errors=(\d+)",
+            log_text,
+        )
+    ]
+
+
 def audit(summary, records, log_text):
     if summary["status"] != "completed" or summary["error_summary"]:
         raise ValueError("Benchmark did not complete without reported errors")
@@ -145,10 +155,7 @@ def audit(summary, records, log_text):
         and summary["metrics"]["error_request_count"]["avg"] != 0
     ):
         raise ValueError("Request errors in aggregate metric")
-    phases = re.findall(
-        r"Phase profiling \(profiling\) complete \| completed=(\d+), cancelled=(\d+), errors=(\d+)",
-        log_text,
-    )
+    phases = profiling_counts(log_text)
     if len(phases) != 1:
         raise ValueError("Missing or ambiguous final profiling phase counts")
     if re.search(
@@ -158,7 +165,9 @@ def audit(summary, records, log_text):
         raise ValueError(
             "Profiling exhausted the grace period; throughput includes an incomplete drain"
         )
-    completed, cancelled, errors = map(int, phases[0])
+    completed, cancelled, errors = (
+        phases[0][key] for key in ("completed", "cancelled", "errors")
+    )
     if completed != count or errors:
         raise ValueError("Phase totals disagree or include errors")
     if summary["scenario"]["mode"] == "smoke" and (
@@ -185,17 +194,35 @@ def main(operation, run_root):
         return
     if operation != "audit":
         raise ValueError("Expected prepare or audit")
-    paths = list((run_root / "client").rglob("agentx_summary.json"))
-    if len(paths) != 1:
-        raise ValueError("Expected exactly one AgentX summary")
-    summary = json.loads(paths[0].read_text())
-    artifact = paths[0].parent / "aiperf"
-    records = [
-        json.loads(line)
-        for line in (artifact / "profile_export.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    result = audit(summary, records, (artifact / "logs/aiperf.log").read_text())
+    log_text = ""
+    try:
+        paths = list((run_root / "client").rglob("agentx_summary.json"))
+        if len(paths) != 1:
+            raise ValueError("Expected exactly one AgentX summary")
+        artifact = paths[0].parent / "aiperf"
+        log_text = (artifact / "logs/aiperf.log").read_text()
+        summary = json.loads(paths[0].read_text())
+        records = [
+            json.loads(line)
+            for line in (artifact / "profile_export.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        result = audit(summary, records, log_text)
+    except Exception as error:
+        phases = profiling_counts(log_text)
+        result = {
+            "status": "rejected",
+            "reason": str(error),
+            "error_type": type(error).__name__,
+            "completed": None,
+            "cancelled": None,
+            "errors": None,
+            "profiling_phase_counts": phases,
+        }
+        if len(phases) == 1:
+            result.update(phases[0])
+        (run_root / "audit.json").write_text(json.dumps(result, indent=2) + "\n")
+        raise
     (run_root / "audit.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
 
