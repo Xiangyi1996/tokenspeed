@@ -67,7 +67,7 @@ def prepare(run_root):
         raise ValueError("Benchmark duration must be >=900 seconds")
     if int(os.environ["CLIENT_TIMEOUT"]) <= duration:
         raise ValueError("CLIENT_TIMEOUT must include initialization and drain time")
-    trace = Path(os.environ["DATASET_PATH"]) / "traces.jsonl"
+    trace = run_root / "dataset" / "traces.jsonl"
     environment = {
         key: os.environ[key]
         for key in (
@@ -104,6 +104,7 @@ def prepare(run_root):
         "harness_sha256": file_sha256(run_root / "harness.slurm"),
         "auditor_sha256": file_sha256(Path(__file__)),
         "server_script_sha256": file_sha256(Path(environment["SERVER_SCRIPT"])),
+        "dataset_path": str(trace.parent),
         "dataset_sha256": file_sha256(trace),
         "client_arch": platform.machine(),
         "python": sys.version,

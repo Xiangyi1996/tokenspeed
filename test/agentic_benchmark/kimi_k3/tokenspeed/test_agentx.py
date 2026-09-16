@@ -43,7 +43,7 @@ SPEC.loader.exec_module(RESULT)
 
 
 class ManifestTest(unittest.TestCase):
-    def test_manifest_identifies_executed_launcher_and_auditor(self):
+    def test_manifest_identifies_run_snapshots_and_auditor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             auditor = root / "agentx_result.py"
@@ -53,6 +53,7 @@ class ManifestTest(unittest.TestCase):
                 "harness.slurm",
                 "server.sh",
                 "traces.jsonl",
+                "dataset/traces.jsonl",
                 "adapter.py",
                 "timing/phase/runner.py",
                 "credit/callback_handler.py",
@@ -121,6 +122,16 @@ class ManifestTest(unittest.TestCase):
                 )
                 (root / "agentx.slurm").write_text("Changed checkout after submission")
                 self.assertEqual(
+                    before["dataset_sha256"],
+                    hashlib.sha256(
+                        (root / "dataset/traces.jsonl").read_bytes()
+                    ).hexdigest(),
+                )
+                self.assertEqual(before["dataset_path"], str(root / "dataset"))
+                (root / "traces.jsonl").write_text(
+                    "Shared dataset replaced after preparation"
+                )
+                self.assertEqual(
                     before["auditor_sha256"],
                     hashlib.sha256(auditor.read_bytes()).hexdigest(),
                 )
@@ -140,6 +151,7 @@ class ManifestTest(unittest.TestCase):
                 )
             self.assertEqual(before["harness_commit"], after["harness_commit"])
             self.assertEqual(before["harness_sha256"], after["harness_sha256"])
+            self.assertEqual(before["dataset_sha256"], after["dataset_sha256"])
             self.assertNotEqual(before["auditor_sha256"], after["auditor_sha256"])
             self.assertEqual(
                 after["auditor_sha256"],
@@ -238,6 +250,7 @@ class LifecycleTest(unittest.TestCase):
         for case in (
             "success",
             "spool_copy",
+            "dataset_replaced",
             "client_failure",
             "client_sigterm",
             "client_sigint",
@@ -275,6 +288,7 @@ done
 case "$CASE" in
 preflight_sigterm|preflight_sigint) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" ;;
 preflight_failure) exit 23 ;;
+dataset_replaced) echo "Replaced shared trace" > "$DATASET_PATH/traces.jsonl" ;;
 esac
 exit 0""",
                     "scancel": '''echo "$*" >> "$TEST_ROOT/cancelled"
@@ -363,6 +377,8 @@ while True:
                     "benchmark_grace_period": 30,
                 }
                 scenario.write_text(json.dumps(scenario_config))
+                trace_content = b'{"trace": "original"}\n'
+                (root / "traces.jsonl").write_bytes(trace_content)
                 run = root / "output"
                 env = dict(
                     os.environ,
@@ -484,7 +500,14 @@ while True:
                     stdout, stderr = process.communicate(timeout=8)
                     self.assertEqual(
                         process.returncode == 0,
-                        case in ("success", "spool_copy", "hold", "hold_marker"),
+                        case
+                        in (
+                            "success",
+                            "spool_copy",
+                            "dataset_replaced",
+                            "hold",
+                            "hold_marker",
+                        ),
                         stderr,
                     )
                     if case.endswith(("sigterm", "sigint")) or case == "client_timeout":
@@ -571,6 +594,17 @@ while True:
                             json.loads(arguments[arguments.index("--scenario") + 1]),
                             scenario_config,
                         )
+                        dataset_path = Path(
+                            arguments[arguments.index("--dataset-path") + 1]
+                        )
+                        self.assertEqual(dataset_path, run / "dataset")
+                        self.assertEqual(
+                            (dataset_path / "traces.jsonl").read_bytes(), trace_content
+                        )
+                        if case == "dataset_replaced":
+                            self.assertNotEqual(
+                                (root / "traces.jsonl").read_bytes(), trace_content
+                            )
                     if case in ("occupied", "startup_failure"):
                         self.assertFalse((root / "client-called").exists())
                 finally:

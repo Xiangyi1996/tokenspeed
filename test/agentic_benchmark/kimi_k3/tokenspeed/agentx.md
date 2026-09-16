@@ -89,6 +89,10 @@ export RUN_ROOT=/shared/new-agentx-output
 ```
 
 `RUN_ROOT` must not exist and its parent must exist. `mkdir` reserves it atomically.
+Before preparing the manifest, the harness copies `DATASET_PATH/traces.jsonl` to
+`RUN_ROOT/dataset/traces.jsonl`. Both the manifest hash and client use this run-local
+snapshot, so replacing the shared source during server startup cannot change the
+workload. Allow disk space for one trace copy per run and preserve this artifact.
 The harness rejects an occupied HTTP port or GPUs before launching its server.
 Use a dedicated allocation and do not start concurrent independent clients on it.
 For an sbatch launch, set `SOURCE_ROOT` explicitly: the script runs from Slurm's
@@ -181,6 +185,9 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
   in the manifest are provenance records, not a source-allowlist gate.
 - `allocation.txt`, `gpu-preflight.log`, `server.log`: allocation and server evidence.
 - `harness.slurm`: executing launcher snapshot corresponding to `harness_sha256`.
+- `dataset/traces.jsonl`: client input snapshot corresponding to `dataset_sha256`.
+  The manifest's `dataset_path` identifies the consumed directory;
+  `environment.DATASET_PATH` retains the original source directory.
 - `client/`: EvalScope summaries, AIPerf raw summary, JSONL and phase logs.
 - `audit.json`: successful, cancelled and errored profiling counts.
 - `client-exit-code.txt`: command/audit outcome; inspect `audit.json` as well.
@@ -206,8 +213,9 @@ SIGINT/SIGTERM and readiness timeout before server step registration,
 client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
 execution and hold, and cleanup isolation. Client-stage tests include a child
 process and verify both processes stop before the harness exits.
-They also check server parameters, uncommitted result auditor edits, and execution
-from a spool copy that differs from the checkout. No GPU allocation
+They also check server parameters, uncommitted result auditor edits, execution
+from a spool copy that differs from the checkout, and replacement of the shared
+dataset after preparation without changing the client's snapshot. No GPU allocation
 is created.
 
 

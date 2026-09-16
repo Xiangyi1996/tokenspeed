@@ -59,6 +59,8 @@ mkdir "$RUN_ROOT"
 # sbatch executes a spool copy that can differ from the current checkout.
 cp -- "${BASH_SOURCE[0]}" "$RUN_ROOT/harness.slurm"
 cp "$SCENARIO_FILE" "$RUN_ROOT/scenario.json"
+mkdir "$RUN_ROOT/dataset"
+cp -- "$DATASET_PATH/traces.jsonl" "$RUN_ROOT/dataset/traces.jsonl"
 "$CLIENT_PYTHON" "$SCRIPT_DIR/agentx_result.py" prepare "$RUN_ROOT"
 scontrol show job "$SLURM_JOB_ID" > "$RUN_ROOT/allocation.txt"
 mapfile -t NODES < <(scontrol show hostnames "$(squeue -h -j "$SLURM_JOB_ID" -o '%N')")
@@ -152,7 +154,7 @@ timeout --signal=INT --kill-after=45 "$CLIENT_TIMEOUT" "$CLIENT_PYTHON" -c \
     'from evalscope.cli.cli import run_cmd; run_cmd()' perf \
     --scenario "$(cat "$RUN_ROOT/scenario.json")" --model "$MODEL_NAME" \
     --tokenizer-path "$TOKENIZER_PATH" --url "$BASE_URL/v1/chat/completions" \
-    --dataset-path "$DATASET_PATH" --parallel "$CONCURRENCY" --duration "$DURATION" \
+    --dataset-path "$RUN_ROOT/dataset" --parallel "$CONCURRENCY" --duration "$DURATION" \
     --seed "$SEED" --outputs-dir "$RUN_ROOT/client" > "$RUN_ROOT/client.log" 2>&1 &
 CLIENT_PID=$!
 # Bash runs signal traps promptly while waiting for a tracked background child.
