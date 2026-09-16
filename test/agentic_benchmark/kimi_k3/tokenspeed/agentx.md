@@ -116,8 +116,12 @@ failure, until `touch "$RUN_ROOT/release-requested"`, server exit or allocation
 expiry. SIGINT/SIGTERM stops the invocation's server step. With `HOLD_AFTER_RUN=0`,
 only that step is stopped after the run; an independently held allocation survives.
 A directly submitted batch allocation ends when its batch script exits.
-A signal received during hold exits with 130 (SIGINT) or 143 (SIGTERM), records
-that code, and still cleans up the invocation's own server step. The separate
+A signal received while the client runs or during hold exits with 130 (SIGINT)
+or 143 (SIGTERM) and records that code. During a client run, the harness forwards
+the signal through GNU `timeout` to the client's process group and waits for it
+to exit before cleaning up its own server step. An unresponsive client is killed
+after the existing 45-second kill-after interval. Cancellation skips service hold
+even when `HOLD_AFTER_RUN=1`. The separate
 held allocation and unrelated steps remain intact.
 A controller can also create `RUN_ROOT/hold-after-client` before a successful
 client audit to retain that service for more client runs; the same
@@ -184,7 +188,9 @@ bash -n test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm
 ```
 
 Tests use fake Slurm/HTTP commands to exercise port conflicts, startup failure,
-client failure, hold/release, SIGINT/SIGTERM during hold and cleanup isolation.
+client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
+execution and hold, and cleanup isolation. Client-stage tests include a child
+process and verify both processes stop before the harness exits.
 They also check that changes to server parameters are recorded. No GPU allocation
 is created.
 

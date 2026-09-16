@@ -26,6 +26,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -132,6 +133,9 @@ class LifecycleTest(unittest.TestCase):
         for case in (
             "success",
             "client_failure",
+            "client_sigterm",
+            "client_sigint",
+            "client_timeout",
             "hold",
             "hold_marker",
             "hold_sigterm",
@@ -156,6 +160,9 @@ case "$arg" in --job-name=*) echo "123.1 ${arg#--job-name=}" > "$TEST_ROOT/step"
 done
 exit 0""",
                     "scancel": '''echo "$*" >> "$TEST_ROOT/cancelled"
+case "$CASE" in client_sigterm|client_sigint|client_timeout)
+    [ -f "$TEST_ROOT/client-stopped" ] || touch "$TEST_ROOT/premature-server-cleanup" ;;
+esac
 [ "$1" = 123.1 ] && kill "$(cat "$TEST_ROOT/server-pid")"''',
                     "curl": """if [ "$CASE" = occupied ]; then exit 0; fi
 if [ ! -f "$TEST_ROOT/step" ] || [ "$CASE" = startup_failure ]; then exit 7; fi
@@ -164,6 +171,7 @@ echo "{}"
                     "sleep": "exec /usr/bin/sleep 0.05",
                     "python": """if [ "$1" = -c ]; then
  touch "$TEST_ROOT/client-called"
+ case "$CASE" in client_sigterm|client_sigint|client_timeout) exec "$TEST_PYTHON" "$TEST_ROOT/client.py" ;; esac
  if [ "$CASE" = hold_marker ]; then touch "$RUN_ROOT/hold-after-client"; fi
  [ "$CASE" != client_failure ]
 else exit 0
@@ -173,6 +181,36 @@ fi""",
                     path = binaries / name
                     path.write_text("#!/bin/bash\n" + body + "\n")
                     path.chmod(0o755)
+                (root / "client.py").write_text("""import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+root = Path(os.environ["TEST_ROOT"])
+role = "worker" if len(sys.argv) > 1 else "client"
+received = None
+
+def stop(signum, frame):
+    global received
+    received = signum
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+(root / (role + "-pid")).write_text(str(os.getpid()))
+if role == "client":
+    (root / "client-pgid").write_text(str(os.getpgrp()))
+    child = subprocess.Popen([sys.executable, __file__, "worker"])
+    while not (root / "worker-ready").exists():
+        time.sleep(0.01)
+(root / (role + "-ready")).touch()
+while received is None:
+    time.sleep(0.01)
+if role == "client":
+    child.wait(timeout=5)
+(root / (role + "-stopped")).write_text(str(received))
+""")
                 server = root / "server.sh"
                 server.touch()
                 scenario = root / "scenario.json"
@@ -182,6 +220,7 @@ fi""",
                     os.environ,
                     PATH=str(binaries) + os.pathsep + os.environ["PATH"],
                     TEST_ROOT=str(root),
+                    TEST_PYTHON=sys.executable,
                     CASE=case,
                     SLURM_JOB_ID="123",
                     SOURCE_ROOT=str(ROOT.parents[4]),
@@ -199,9 +238,18 @@ fi""",
                     API_PORT="8000",
                     READINESS_PATH="/readiness",
                     READINESS_TIMEOUT="1",
-                    CLIENT_TIMEOUT="90",
+                    CLIENT_TIMEOUT="2" if case == "client_timeout" else "90",
                     HOLD_AFTER_RUN=(
-                        "1" if case in ("hold", "hold_sigterm", "hold_sigint") else "0"
+                        "1"
+                        if case
+                        in (
+                            "hold",
+                            "hold_sigterm",
+                            "hold_sigint",
+                            "client_sigterm",
+                            "client_sigint",
+                        )
+                        else "0"
                     ),
                     RUN_ROOT=str(run),
                 )
@@ -213,6 +261,19 @@ fi""",
                     text=True,
                 )
                 try:
+                    if case in ("client_sigterm", "client_sigint"):
+                        deadline = time.monotonic() + 5
+                        while (
+                            not (root / "client-ready").exists()
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        self.assertTrue((root / "client-ready").exists())
+                        process.send_signal(
+                            signal.SIGTERM
+                            if case == "client_sigterm"
+                            else signal.SIGINT
+                        )
                     if case.startswith("hold"):
                         deadline = time.monotonic() + 5
                         while (
@@ -236,12 +297,31 @@ fi""",
                         case in ("success", "hold", "hold_marker"),
                         stderr,
                     )
-                    if case in ("hold_sigterm", "hold_sigint"):
-                        expected = 143 if case == "hold_sigterm" else 130
+                    if case.endswith(("sigterm", "sigint")) or case == "client_timeout":
+                        expected = (
+                            124
+                            if case == "client_timeout"
+                            else 143 if case.endswith("sigterm") else 130
+                        )
                         self.assertEqual(process.returncode, expected)
                         self.assertEqual(
                             int((run / "client-exit-code.txt").read_text()), expected
                         )
+                    if case in ("client_sigterm", "client_sigint", "client_timeout"):
+                        expected_signal = (
+                            signal.SIGTERM
+                            if case == "client_sigterm"
+                            else signal.SIGINT
+                        )
+                        for role in ("client", "worker"):
+                            self.assertEqual(
+                                int((root / (role + "-stopped")).read_text()),
+                                expected_signal,
+                            )
+                            with self.assertRaises(ProcessLookupError):
+                                os.kill(int((root / (role + "-pid")).read_text()), 0)
+                        self.assertFalse((run / "allocation-held.txt").exists())
+                        self.assertFalse((root / "premature-server-cleanup").exists())
                     if case == "occupied":
                         self.assertFalse((root / "step").exists())
                     else:
@@ -251,8 +331,15 @@ fi""",
                     if case in ("occupied", "startup_failure"):
                         self.assertFalse((root / "client-called").exists())
                 finally:
+                    if (root / "client-pgid").exists():
+                        try:
+                            os.killpg(
+                                int((root / "client-pgid").read_text()), signal.SIGKILL
+                            )
+                        except ProcessLookupError:
+                            pass
                     if process.poll() is None:
-                        process.terminate()
+                        process.kill()
                         process.communicate(timeout=5)
                     # Also reap the fake server if the behavior under test leaked it.
                     if (root / "server-pid").exists():

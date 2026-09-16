@@ -71,13 +71,23 @@ fi
 export NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 STEP_NAME="agentx_server_${SLURM_JOB_ID}_$$"
 SERVER_PID=
+CLIENT_PID=
+CLIENT_SIGNAL=TERM
 finish() {
     local result=$?
+    # Stop and reap the client before releasing its server. GNU timeout forwards
+    # the signal to the client's process group and retains its kill-after bound.
+    trap '' INT TERM
+    trap - EXIT
+    if [[ -n "$CLIENT_PID" ]]; then
+        kill -s "$CLIENT_SIGNAL" "$CLIENT_PID" 2>/dev/null || true
+        wait "$CLIENT_PID" 2>/dev/null || true
+        CLIENT_PID=
+    fi
     # While holding, a signal requests release through this same cleanup path.
     # Do not exit from a signal handler after removing the EXIT trap.
     trap 'result=130; HOLD_AFTER_RUN=0' INT
     trap 'result=143; HOLD_AFTER_RUN=0' TERM
-    trap - EXIT
     printf '%s\n' "$result" > "$RUN_ROOT/client-exit-code.txt"
     if [[ "$HOLD_AFTER_RUN" = 1 && -n "$SERVER_PID" ]]; then
         echo 'Holding allocation; touch RUN_ROOT/release-requested to release' > "$RUN_ROOT/allocation-held.txt"
@@ -94,8 +104,8 @@ finish() {
     exit "$result"
 }
 trap finish EXIT
-trap 'HOLD_AFTER_RUN=0; exit 130' INT
-trap 'HOLD_AFTER_RUN=0; exit 143' TERM
+trap 'HOLD_AFTER_RUN=0; CLIENT_SIGNAL=INT; exit 130' INT
+trap 'HOLD_AFTER_RUN=0; CLIENT_SIGNAL=TERM; exit 143' TERM
 SRUN=(srun --jobid="$SLURM_JOB_ID" --overlap --nodes="${#NODES[@]}" --ntasks-per-node=1
     --container-image="$CONTAINER_IMAGE" --container-name="agentx_${SLURM_JOB_ID}_$$"
     --container-mounts="$CONTAINER_MOUNTS" --container-workdir="$SOURCE_ROOT"
@@ -125,7 +135,13 @@ timeout --signal=INT --kill-after=45 "$CLIENT_TIMEOUT" "$CLIENT_PYTHON" -c \
     --scenario "$(cat "$RUN_ROOT/scenario.json")" --model "$MODEL_NAME" \
     --tokenizer-path "$TOKENIZER_PATH" --url "$BASE_URL/v1/chat/completions" \
     --dataset-path "$DATASET_PATH" --parallel "$CONCURRENCY" --duration "$DURATION" \
-    --seed "$SEED" --outputs-dir "$RUN_ROOT/client" > "$RUN_ROOT/client.log" 2>&1
+    --seed "$SEED" --outputs-dir "$RUN_ROOT/client" > "$RUN_ROOT/client.log" 2>&1 &
+CLIENT_PID=$!
+# Bash runs signal traps promptly while waiting for a tracked background child.
+CLIENT_RESULT=0
+wait "$CLIENT_PID" || CLIENT_RESULT=$?
+CLIENT_PID=
+if (( CLIENT_RESULT != 0 )); then exit "$CLIENT_RESULT"; fi
 "$CLIENT_PYTHON" "$SCRIPT_DIR/agentx_result.py" audit "$RUN_ROOT"
 
 # A controller may retain a successful service for additional client runs.
