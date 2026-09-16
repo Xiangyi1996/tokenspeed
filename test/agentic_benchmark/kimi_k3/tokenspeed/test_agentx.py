@@ -230,6 +230,9 @@ class LifecycleTest(unittest.TestCase):
             "startup_sigterm",
             "startup_sigint",
             "startup_timeout",
+            "preflight_sigterm",
+            "preflight_sigint",
+            "preflight_failure",
         ):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -248,6 +251,10 @@ case "$arg" in --job-name=*)
 case "$CASE" in startup_sigterm|startup_sigint|startup_timeout) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" "${arg#--job-name=}" ;; esac
 echo "123.1 ${arg#--job-name=}" > "$TEST_ROOT/step"; echo $$ > "$TEST_ROOT/server-pid"; exec /usr/bin/sleep 30 ;; esac
 done
+case "$CASE" in
+preflight_sigterm|preflight_sigint) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" ;;
+preflight_failure) exit 23 ;;
+esac
 exit 0""",
                     "scancel": '''echo "$*" >> "$TEST_ROOT/cancelled"
 case "$CASE" in client_sigterm|client_sigint|client_timeout)
@@ -261,6 +268,7 @@ echo "{}"
                     "sleep": "exec /usr/bin/sleep 0.05",
                     "python": """if [ "$1" = -c ]; then
  touch "$TEST_ROOT/client-called"
+ printf '%s\\0' "$@" > "$TEST_ROOT/client-arguments"
  case "$CASE" in client_sigterm|client_sigint|client_timeout) exec "$TEST_PYTHON" "$TEST_ROOT/client.py" ;; esac
  if [ "$CASE" = hold_marker ]; then touch "$RUN_ROOT/hold-after-client"; fi
  [ "$CASE" != client_failure ]
@@ -308,25 +316,32 @@ import time
 from pathlib import Path
 
 root = Path(os.environ["TEST_ROOT"])
+role = "server" if len(sys.argv) > 1 else "preflight"
 
 def stop(signum, frame):
-    (root / "server-stopped").write_text(str(signum))
+    (root / (role + "-stopped")).write_text(str(signum))
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, stop)
-(root / "server-pid").write_text(str(os.getpid()))
-(root / "server-ready").touch()
-# Make cleanup miss this step deterministically, then register it late.
-while not (root / "step-lookup-missed").exists():
-    time.sleep(0.01)
-(root / "step").write_text("123.1 " + sys.argv[1])
+(root / (role + "-pid")).write_text(str(os.getpid()))
+(root / (role + "-ready")).touch()
+if role == "server":
+    # Make cleanup miss this step deterministically, then register it late.
+    while not (root / "step-lookup-missed").exists():
+        time.sleep(0.01)
+    (root / "step").write_text("123.1 " + sys.argv[1])
 while True:
     time.sleep(0.01)
 """)
                 server = root / "server.sh"
                 server.touch()
                 scenario = root / "scenario.json"
-                scenario.write_text("{}")
+                scenario_config = {
+                    "name": "agentx",
+                    "mode": "smoke",
+                    "benchmark_grace_period": 30,
+                }
+                scenario.write_text(json.dumps(scenario_config))
                 run = root / "output"
                 env = dict(
                     os.environ,
@@ -364,6 +379,9 @@ while True:
                             "client_sigint",
                             "startup_sigterm",
                             "startup_sigint",
+                            "preflight_sigterm",
+                            "preflight_sigint",
+                            "preflight_failure",
                         )
                         else "0"
                     ),
@@ -377,6 +395,19 @@ while True:
                     text=True,
                 )
                 try:
+                    if case in ("preflight_sigterm", "preflight_sigint"):
+                        deadline = time.monotonic() + 5
+                        while (
+                            not (root / "preflight-ready").exists()
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        self.assertTrue((root / "preflight-ready").exists())
+                        process.send_signal(
+                            signal.SIGTERM
+                            if case.endswith("sigterm")
+                            else signal.SIGINT
+                        )
                     if case in ("startup_sigterm", "startup_sigint"):
                         deadline = time.monotonic() + 5
                         while (
@@ -467,11 +498,40 @@ while True:
                         self.assertFalse((root / "cancelled").exists())
                         self.assertFalse((root / "client-called").exists())
                         self.assertFalse((run / "allocation-held.txt").exists())
+                    elif case.startswith("preflight"):
+                        if case == "preflight_failure":
+                            self.assertEqual(process.returncode, 23)
+                            self.assertEqual(
+                                (run / "client-exit-code.txt").read_text().strip(), "23"
+                            )
+                        else:
+                            self.assertEqual(
+                                int((root / "preflight-stopped").read_text()),
+                                signal.SIGTERM,
+                            )
+                            with self.assertRaises(ProcessLookupError):
+                                os.kill(int((root / "preflight-pid").read_text()), 0)
+                        self.assertFalse((root / "server-pid").exists())
+                        self.assertFalse((root / "step").exists())
+                        self.assertFalse((root / "cancelled").exists())
+                        self.assertFalse((root / "client-called").exists())
+                        self.assertFalse((run / "allocation-held.txt").exists())
                     elif case == "occupied":
                         self.assertFalse((root / "step").exists())
                     else:
                         self.assertEqual(
                             (root / "cancelled").read_text().splitlines(), ["123.1"]
+                        )
+                    if (root / "client-called").exists():
+                        arguments = (
+                            (root / "client-arguments")
+                            .read_bytes()
+                            .decode()
+                            .split("\0")
+                        )
+                        self.assertEqual(
+                            json.loads(arguments[arguments.index("--scenario") + 1]),
+                            scenario_config,
                         )
                     if case in ("occupied", "startup_failure"):
                         self.assertFalse((root / "client-called").exists())
@@ -487,13 +547,15 @@ while True:
                         process.kill()
                         process.communicate(timeout=5)
                     # Also reap the fake server if the behavior under test leaked it.
-                    if (root / "server-pid").exists():
-                        try:
-                            os.kill(
-                                int((root / "server-pid").read_text()), signal.SIGKILL
-                            )
-                        except ProcessLookupError:
-                            pass
+                    for role in ("server", "preflight"):
+                        if (root / (role + "-pid")).exists():
+                            try:
+                                os.kill(
+                                    int((root / (role + "-pid")).read_text()),
+                                    signal.SIGKILL,
+                                )
+                            except ProcessLookupError:
+                                pass
 
 
 if __name__ == "__main__":

@@ -71,6 +71,7 @@ fi
 export NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 STEP_NAME="agentx_server_${SLURM_JOB_ID}_$$"
 SERVER_PID=
+PREFLIGHT_PID=
 CLIENT_PID=
 CLIENT_SIGNAL=TERM
 finish() {
@@ -83,6 +84,11 @@ finish() {
         kill -s "$CLIENT_SIGNAL" "$CLIENT_PID" 2>/dev/null || true
         wait "$CLIENT_PID" 2>/dev/null || true
         CLIENT_PID=
+    fi
+    if [[ -n "$PREFLIGHT_PID" ]]; then
+        kill -TERM "$PREFLIGHT_PID" 2>/dev/null || true
+        wait "$PREFLIGHT_PID" 2>/dev/null || true
+        PREFLIGHT_PID=
     fi
     # While holding, a signal requests release through this same cleanup path.
     # Do not exit from a signal handler after removing the EXIT trap.
@@ -120,7 +126,12 @@ SRUN=(srun --jobid="$SLURM_JOB_ID" --overlap --nodes="${#NODES[@]}" --ntasks-per
     occupied=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)
     if [[ -n "$occupied" ]]; then echo "GPUs already occupied: $occupied" >&2; exit 1; fi
     nvidia-smi --query-gpu=name,uuid,driver_version --format=csv
-' > "$RUN_ROOT/gpu-preflight.log" 2>&1
+' > "$RUN_ROOT/gpu-preflight.log" 2>&1 &
+PREFLIGHT_PID=$!
+PREFLIGHT_RESULT=0
+wait "$PREFLIGHT_PID" || PREFLIGHT_RESULT=$?
+PREFLIGHT_PID=
+if (( PREFLIGHT_RESULT != 0 )); then exit "$PREFLIGHT_RESULT"; fi
 "${SRUN[@]}" --job-name="$STEP_NAME" --mpi=pmix --kill-on-bad-exit=1 \
     bash "$SERVER_SCRIPT" > "$RUN_ROOT/server.log" 2>&1 &
 SERVER_PID=$!

@@ -7,24 +7,24 @@ No packages are installed on the GPUs by the harness.
 
 ## Prepare the client and server
 
-Use an EvalScope version containing PR #1745 for custom K3 tokenizers. A pinned
-base installation is:
+Use an EvalScope version containing PR #1745 for custom K3 tokenizers and
+PR #1747 for configurable benchmark grace. The following upstream commit includes
+both changes:
 
 ```bash
 export SOURCE_ROOT=/absolute/path/to/tokenspeed
 export AGENTX_SCRIPTS="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed"
 python3.12 -m venv /absolute/path/to/client-venv
 source /absolute/path/to/client-venv/bin/activate
-python -m pip install 'evalscope[agentx] @ git+https://github.com/modelscope/evalscope.git@0fc9b81bc5824a9f9a33a01ce59d675814b2e99e'
+python -m pip install 'evalscope[agentx] @ git+https://github.com/modelscope/evalscope.git@d7eb1da2a8a4400fe7cd33f0d6988b2b1ee7b790'
 python -m pip check
 python -m pip freeze --all > /absolute/path/to/client-requirements.txt
 ```
 
 The launcher uses your selected client as installed. It does not apply patches
-or enforce source hashes. The unmodified base can run AgentX, but some workloads
-on its AIPerf 0.12.0 dependency can hit the drain issues described below.
-The launcher does not ship client patches. Before using a different dependency
-version for a formal comparison, validate its drain behavior with both engines.
+or enforce source hashes. The pinned version supports the grace setting below
+without local EvalScope changes. Before changing a client version for a formal
+comparison, validate its behavior with both engines and retain its version record.
 
 The client runs on the **orchestrating host**. On ARM GPU nodes, `sbatch` requires
 an ARM client venv. To reuse an x86 client on a login host, first obtain a held
@@ -48,7 +48,8 @@ Create `/absolute/path/to/scenario.json`:
   "engine": "tokenspeed",
   "engine_version": "RECORD_YOUR_SERVER_COMMIT",
   "hardware": "GB300",
-  "request_timeout_seconds": 900
+  "request_timeout_seconds": 900,
+  "benchmark_grace_period": 30
 }
 ```
 
@@ -116,8 +117,11 @@ failure, until `touch "$RUN_ROOT/release-requested"`, server exit or allocation
 expiry. SIGINT/SIGTERM stops the invocation's server step. With `HOLD_AFTER_RUN=0`,
 only that step is stopped after the run; an independently held allocation survives.
 A directly submitted batch allocation ends when its batch script exits.
-A signal received while the client runs or during hold exits with 130 (SIGINT)
-or 143 (SIGTERM) and records that code. During a client run, the harness forwards
+A signal received during GPU preflight, server startup, client execution or hold
+exits with 130 (SIGINT) or 143 (SIGTERM) and records that code. The preflight runs
+as a tracked background child; cancellation terminates and reaps its `srun` before
+exiting. Preflight failure preserves its exit code and prevents server/client launch.
+During a client run, the harness forwards
 the signal through GNU `timeout` to the client's process group and waits for it
 to exit before cleaning up its own server step. An unresponsive client is killed
 after the existing 45-second kill-after interval. Cancellation skips service hold
@@ -192,7 +196,8 @@ python test/agentic_benchmark/kimi_k3/tokenspeed/test_agentx.py
 bash -n test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm
 ```
 
-Tests use fake Slurm/HTTP commands to exercise port conflicts, startup failure,
+Tests use fake Slurm/HTTP commands to exercise port conflicts, preflight failure,
+SIGINT/SIGTERM during preflight, startup failure,
 SIGINT/SIGTERM and readiness timeout before server step registration,
 client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
 execution and hold, and cleanup isolation. Client-stage tests include a child
@@ -204,31 +209,28 @@ is created.
 
 ## Drain time
 
-AIPerf 0.12.0 defaults to 30 seconds for outstanding responses after the measurement
-duration. A long generation can exceed that time even when the engine is healthy.
-This is separate from `request_timeout_seconds`. Keep the zero-cancellation smoke
-audit and preserve failed runs when changing the client or drain settings.
+The pinned EvalScope version accepts `benchmark_grace_period` in the scenario
+JSON and forwards it to the existing AIPerf option. The launcher passes the scenario
+through unchanged and records its configuration in `manifest.json`.
 
-The audit rejects a profiling grace-period timeout even when all exported requests
-succeeded. Pending replay branches can otherwise leave the client idle until the
-timeout and distort aggregate throughput. This result check applies to whichever
-client you choose; it does not require a specific source hash.
+The example explicitly uses 30 seconds, matching AIPerf 0.12.0's default. Omitting
+the field retains the client's default. Finite, nonnegative values are supported,
+including zero. If the agreed experiment protocol needs a longer drain, set, for
+example, `"benchmark_grace_period": 600`. This is a maximum wait after sending stops;
+it does not require waiting the full period when all in-flight requests finish.
+The setting is independent of `DURATION` and `request_timeout_seconds`.
 
-### Client version limitations
+Choose the grace period before comparing engines and use the same value for both.
+Changing it can change the completed request set and throughput observation time;
+report actual phase duration and cancellation counts alongside the metrics.
+`CLIENT_TIMEOUT` must allow for dataset reconstruction, warmup, `DURATION`, the
+chosen grace period, and final cleanup. The Slurm allocation must additionally
+cover server startup and any requested hold time.
 
-The pinned EvalScope commit above does not expose AIPerf's grace-period option.
-The missing parameter belongs in EvalScope; the hard-cutoff replay drain behavior
-belongs in AIPerf. Keep those dependency fixes upstream rather than applying them
-from a model's server launcher. This directory does not bundle dependency patches.
-
-Until an upstream version includes the required behavior, distinguish successful
-functional smoke from a formal zero-cancellation, normally drained baseline.
-A clean upstream smoke can succeed; that does not establish that every long-run
-workload will drain within the default window. For a failed audit, preserve the
-artifacts and resolve the client issue before reporting a formal comparison.
-
-If a particular experiment uses temporary client modifications, retain its exact
-patches and regression evidence with the experiment artifacts, and label its
-results accordingly. Do not describe patched results as validation of the clean
-base install. This is an experiment-specific workaround, not a prerequisite for
-all users of this launcher. Replace it with a tested upstream version when available.
+The audit rejects a profiling grace-period timeout even when exported requests
+succeeded. This is an acceptance policy for this harness, not evidence by itself
+of an engine fault or an empty wait: inspect the final counts and raw logs to
+distinguish unfinished requests from a stalled drain. A longer grace period does
+not fix a stalled drain or guarantee zero cancellations. Preserve failed artifacts
+when changing the client or drain settings. This launcher does not patch client
+scheduling or recalculate its metrics.
