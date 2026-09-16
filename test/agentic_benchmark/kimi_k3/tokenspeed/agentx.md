@@ -123,6 +123,8 @@ to exit before cleaning up its own server step. An unresponsive client is killed
 after the existing 45-second kill-after interval. Cancellation skips service hold
 even when `HOLD_AFTER_RUN=1`. The separate
 held allocation and unrelated steps remain intact.
+Cleanup also sends SIGTERM to the tracked server `srun` before waiting for it.
+This covers cancellation or readiness failure before its step appears in `squeue`.
 A controller can also create `RUN_ROOT/hold-after-client` before a successful
 client audit to retain that service for more client runs; the same
 `release-requested` mechanism applies. This marker does not retain failed runs.
@@ -191,6 +193,7 @@ bash -n test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm
 ```
 
 Tests use fake Slurm/HTTP commands to exercise port conflicts, startup failure,
+SIGINT/SIGTERM and readiness timeout before server step registration,
 client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
 execution and hold, and cleanup isolation. Client-stage tests include a child
 process and verify both processes stop before the harness exits.

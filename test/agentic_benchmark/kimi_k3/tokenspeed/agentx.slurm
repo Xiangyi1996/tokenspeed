@@ -99,7 +99,12 @@ finish() {
     while read -r step name; do
         if [[ "$name" = "$STEP_NAME" ]]; then scancel "$step" || true; fi
     done < <(squeue -h -s -j "$SLURM_JOB_ID" -o '%i %j')
-    if [[ -n "$SERVER_PID" ]]; then wait "$SERVER_PID" 2>/dev/null || true; fi
+    if [[ -n "$SERVER_PID" ]]; then
+        # The tracked srun can still be creating its step and absent from squeue.
+        # TERM also aborts that startup path; do not wait on an unsignalled srun.
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
     printf '%s\n' "$result" > "$RUN_ROOT/client-exit-code.txt"
     exit "$result"
 }

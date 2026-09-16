@@ -227,6 +227,9 @@ class LifecycleTest(unittest.TestCase):
             "hold_sigint",
             "occupied",
             "startup_failure",
+            "startup_sigterm",
+            "startup_sigint",
+            "startup_timeout",
         ):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -237,11 +240,13 @@ class LifecycleTest(unittest.TestCase):
 *"%u"*) id -un ;;
 *"%T"*) echo RUNNING ;;
 *"%N"*) echo testnode ;;
-*"%i %j"*) if [ -f "$TEST_ROOT/step" ]; then cat "$TEST_ROOT/step"; fi; echo "123.99 unrelated_server" ;;
+*"%i %j"*) if [ -f "$TEST_ROOT/step" ]; then cat "$TEST_ROOT/step"; else touch "$TEST_ROOT/step-lookup-missed"; fi; echo "123.99 unrelated_server" ;;
 esac""",
                     "scontrol": """if [ "$1" = show ] && [ "$2" = hostnames ]; then echo testnode; else echo allocation; fi""",
                     "srun": """for arg in "$@"; do
-case "$arg" in --job-name=*) echo "123.1 ${arg#--job-name=}" > "$TEST_ROOT/step"; echo $$ > "$TEST_ROOT/server-pid"; exec /usr/bin/sleep 30 ;; esac
+case "$arg" in --job-name=*)
+case "$CASE" in startup_sigterm|startup_sigint|startup_timeout) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" "${arg#--job-name=}" ;; esac
+echo "123.1 ${arg#--job-name=}" > "$TEST_ROOT/step"; echo $$ > "$TEST_ROOT/server-pid"; exec /usr/bin/sleep 30 ;; esac
 done
 exit 0""",
                     "scancel": '''echo "$*" >> "$TEST_ROOT/cancelled"
@@ -272,7 +277,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 root = Path(os.environ["TEST_ROOT"])
 role = "worker" if len(sys.argv) > 1 else "client"
@@ -296,6 +300,28 @@ while received is None:
 if role == "client":
     child.wait(timeout=5)
 (root / (role + "-stopped")).write_text(str(received))
+""")
+                (root / "pending_srun.py").write_text("""import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+root = Path(os.environ["TEST_ROOT"])
+
+def stop(signum, frame):
+    (root / "server-stopped").write_text(str(signum))
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)
+(root / "server-pid").write_text(str(os.getpid()))
+(root / "server-ready").touch()
+# Make cleanup miss this step deterministically, then register it late.
+while not (root / "step-lookup-missed").exists():
+    time.sleep(0.01)
+(root / "step").write_text("123.1 " + sys.argv[1])
+while True:
+    time.sleep(0.01)
 """)
                 server = root / "server.sh"
                 server.touch()
@@ -323,7 +349,9 @@ if role == "client":
                     SEED="1",
                     API_PORT="8000",
                     READINESS_PATH="/readiness",
-                    READINESS_TIMEOUT="1",
+                    READINESS_TIMEOUT=(
+                        "30" if case in ("startup_sigterm", "startup_sigint") else "1"
+                    ),
                     CLIENT_TIMEOUT="2" if case == "client_timeout" else "90",
                     HOLD_AFTER_RUN=(
                         "1"
@@ -334,6 +362,8 @@ if role == "client":
                             "hold_sigint",
                             "client_sigterm",
                             "client_sigint",
+                            "startup_sigterm",
+                            "startup_sigint",
                         )
                         else "0"
                     ),
@@ -347,6 +377,20 @@ if role == "client":
                     text=True,
                 )
                 try:
+                    if case in ("startup_sigterm", "startup_sigint"):
+                        deadline = time.monotonic() + 5
+                        while (
+                            not (root / "server-ready").exists()
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        self.assertTrue((root / "server-ready").exists())
+                        self.assertFalse((root / "step").exists())
+                        process.send_signal(
+                            signal.SIGTERM
+                            if case.endswith("sigterm")
+                            else signal.SIGINT
+                        )
                     if case in ("client_sigterm", "client_sigint"):
                         deadline = time.monotonic() + 5
                         while (
@@ -408,7 +452,22 @@ if role == "client":
                                 os.kill(int((root / (role + "-pid")).read_text()), 0)
                         self.assertFalse((run / "allocation-held.txt").exists())
                         self.assertFalse((root / "premature-server-cleanup").exists())
-                    if case == "occupied":
+                    if case in ("startup_sigterm", "startup_sigint", "startup_timeout"):
+                        if case == "startup_timeout":
+                            self.assertEqual(process.returncode, 1)
+                            self.assertEqual(
+                                (run / "client-exit-code.txt").read_text().strip(), "1"
+                            )
+                        self.assertTrue((root / "step-lookup-missed").exists())
+                        self.assertEqual(
+                            int((root / "server-stopped").read_text()), signal.SIGTERM
+                        )
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(int((root / "server-pid").read_text()), 0)
+                        self.assertFalse((root / "cancelled").exists())
+                        self.assertFalse((root / "client-called").exists())
+                        self.assertFalse((run / "allocation-held.txt").exists())
+                    elif case == "occupied":
                         self.assertFalse((root / "step").exists())
                     else:
                         self.assertEqual(
@@ -431,7 +490,7 @@ if role == "client":
                     if (root / "server-pid").exists():
                         try:
                             os.kill(
-                                int((root / "server-pid").read_text()), signal.SIGTERM
+                                int((root / "server-pid").read_text()), signal.SIGKILL
                             )
                         except ProcessLookupError:
                             pass
