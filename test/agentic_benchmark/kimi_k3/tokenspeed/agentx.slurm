@@ -56,6 +56,8 @@ SCRIPT_DIR="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed"
 [[ "$(squeue -h -j "$SLURM_JOB_ID" -o '%T')" = RUNNING ]] || { echo 'Allocation must be RUNNING' >&2; exit 1; }
 # Atomic reservation: never overwrite evidence or run the same output twice.
 mkdir "$RUN_ROOT"
+# sbatch executes a spool copy that can differ from the current checkout.
+cp -- "${BASH_SOURCE[0]}" "$RUN_ROOT/harness.slurm"
 cp "$SCENARIO_FILE" "$RUN_ROOT/scenario.json"
 "$CLIENT_PYTHON" "$SCRIPT_DIR/agentx_result.py" prepare "$RUN_ROOT"
 scontrol show job "$SLURM_JOB_ID" > "$RUN_ROOT/allocation.txt"

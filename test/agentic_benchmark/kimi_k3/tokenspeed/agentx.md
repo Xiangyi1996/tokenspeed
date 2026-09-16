@@ -168,8 +168,11 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
   result auditor hash (`auditor_sha256`), harness revision and explicit run settings.
   The auditor hash records the contents of `agentx_result.py` at preparation time,
   including uncommitted edits that the harness revision cannot identify.
-  The harness commit identifies the
-  launcher checkout, not necessarily the code installed in the server image.
+  `harness_sha256` hashes `harness.slurm`, the snapshot of the executing script
+  taken from `BASH_SOURCE[0]` before manifest preparation. For `sbatch`, this is
+  the Slurm spool copy, even if the checkout changed while the job was queued.
+  The harness commit identifies the current source checkout, not necessarily
+  that submitted script or the code installed in the server image.
   `server_configuration` also records `MODEL_DIR`, `DRAFT_DIR`, `SERVER_VENV`,
   `GPU_MEMORY_UTILIZATION`, `SERVER_SEED`, and optional `MODEL_REVISION` /
   `DRAFT_REVISION`. Versions are caller-provided identifiers; unset values are
@@ -177,6 +180,7 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
   revisions and actual server startup/version logs with the run. Existing hashes
   in the manifest are provenance records, not a source-allowlist gate.
 - `allocation.txt`, `gpu-preflight.log`, `server.log`: allocation and server evidence.
+- `harness.slurm`: executing launcher snapshot corresponding to `harness_sha256`.
 - `client/`: EvalScope summaries, AIPerf raw summary, JSONL and phase logs.
 - `audit.json`: successful, cancelled and errored profiling counts.
 - `client-exit-code.txt`: command/audit outcome; inspect `audit.json` as well.
@@ -202,8 +206,8 @@ SIGINT/SIGTERM and readiness timeout before server step registration,
 client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
 execution and hold, and cleanup isolation. Client-stage tests include a child
 process and verify both processes stop before the harness exits.
-They also check that changes to server parameters and uncommitted result auditor
-edits are recorded. No GPU allocation
+They also check server parameters, uncommitted result auditor edits, and execution
+from a spool copy that differs from the checkout. No GPU allocation
 is created.
 
 

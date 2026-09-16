@@ -101,7 +101,7 @@ def prepare(run_root):
         "scenario": scenario.model_dump(),
         "server_configuration": server,
         "harness_commit": commit,
-        "harness_sha256": file_sha256(Path(__file__).with_name("agentx.slurm")),
+        "harness_sha256": file_sha256(run_root / "harness.slurm"),
         "auditor_sha256": file_sha256(Path(__file__)),
         "server_script_sha256": file_sha256(Path(environment["SERVER_SCRIPT"])),
         "dataset_sha256": file_sha256(trace),

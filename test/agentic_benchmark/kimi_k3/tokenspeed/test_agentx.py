@@ -43,13 +43,14 @@ SPEC.loader.exec_module(RESULT)
 
 
 class ManifestTest(unittest.TestCase):
-    def test_manifest_identifies_uncommitted_auditor_changes(self):
+    def test_manifest_identifies_executed_launcher_and_auditor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             auditor = root / "agentx_result.py"
             auditor.write_bytes((ROOT / "agentx_result.py").read_bytes())
             for name in (
                 "agentx.slurm",
+                "harness.slurm",
                 "server.sh",
                 "traces.jsonl",
                 "adapter.py",
@@ -111,6 +112,15 @@ class ManifestTest(unittest.TestCase):
                 RESULT.prepare(root)
                 before = json.loads((root / "manifest.json").read_text())
                 self.assertEqual(
+                    before["harness_sha256"],
+                    hashlib.sha256((root / "harness.slurm").read_bytes()).hexdigest(),
+                )
+                self.assertNotEqual(
+                    before["harness_sha256"],
+                    hashlib.sha256((root / "agentx.slurm").read_bytes()).hexdigest(),
+                )
+                (root / "agentx.slurm").write_text("Changed checkout after submission")
+                self.assertEqual(
                     before["auditor_sha256"],
                     hashlib.sha256(auditor.read_bytes()).hexdigest(),
                 )
@@ -118,6 +128,16 @@ class ManifestTest(unittest.TestCase):
                     stream.write("\n# Local auditor modification without a commit.\n")
                 RESULT.prepare(root)
                 after = json.loads((root / "manifest.json").read_text())
+                (root / "harness.slurm").write_text("Different executed script")
+                RESULT.prepare(root)
+                different_launcher = json.loads((root / "manifest.json").read_text())
+                self.assertNotEqual(
+                    after["harness_sha256"], different_launcher["harness_sha256"]
+                )
+                self.assertEqual(
+                    different_launcher["harness_sha256"],
+                    hashlib.sha256((root / "harness.slurm").read_bytes()).hexdigest(),
+                )
             self.assertEqual(before["harness_commit"], after["harness_commit"])
             self.assertEqual(before["harness_sha256"], after["harness_sha256"])
             self.assertNotEqual(before["auditor_sha256"], after["auditor_sha256"])
@@ -217,6 +237,7 @@ class LifecycleTest(unittest.TestCase):
     def test_cleanup_and_hold(self):
         for case in (
             "success",
+            "spool_copy",
             "client_failure",
             "client_sigterm",
             "client_sigint",
@@ -365,7 +386,7 @@ while True:
                     API_PORT="8000",
                     READINESS_PATH="/readiness",
                     READINESS_TIMEOUT=(
-                        "30" if case in ("startup_sigterm", "startup_sigint") else "1"
+                        "1" if case in ("startup_failure", "startup_timeout") else "30"
                     ),
                     CLIENT_TIMEOUT="2" if case == "client_timeout" else "90",
                     HOLD_AFTER_RUN=(
@@ -387,8 +408,16 @@ while True:
                     ),
                     RUN_ROOT=str(run),
                 )
+                executing_script = ROOT / "agentx.slurm"
+                if case == "spool_copy":
+                    executing_script = root / "slurm spool" / "slurm_script"
+                    executing_script.parent.mkdir()
+                    executing_script.write_bytes(
+                        (ROOT / "agentx.slurm").read_bytes()
+                        + b"\n# Submitted spool copy.\n"
+                    )
                 process = subprocess.Popen(
-                    ["bash", str(ROOT / "agentx.slurm")],
+                    ["bash", str(executing_script)],
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -455,7 +484,7 @@ while True:
                     stdout, stderr = process.communicate(timeout=8)
                     self.assertEqual(
                         process.returncode == 0,
-                        case in ("success", "hold", "hold_marker"),
+                        case in ("success", "spool_copy", "hold", "hold_marker"),
                         stderr,
                     )
                     if case.endswith(("sigterm", "sigint")) or case == "client_timeout":
@@ -521,6 +550,15 @@ while True:
                     else:
                         self.assertEqual(
                             (root / "cancelled").read_text().splitlines(), ["123.1"]
+                        )
+                    self.assertEqual(
+                        (run / "harness.slurm").read_bytes(),
+                        executing_script.read_bytes(),
+                    )
+                    if case == "spool_copy":
+                        self.assertNotEqual(
+                            (run / "harness.slurm").read_bytes(),
+                            (ROOT / "agentx.slurm").read_bytes(),
                         )
                     if (root / "client-called").exists():
                         arguments = (
