@@ -102,6 +102,7 @@ def prepare(run_root):
         "server_configuration": server,
         "harness_commit": commit,
         "harness_sha256": file_sha256(Path(__file__).with_name("agentx.slurm")),
+        "auditor_sha256": file_sha256(Path(__file__)),
         "server_script_sha256": file_sha256(Path(environment["SERVER_SCRIPT"])),
         "dataset_sha256": file_sha256(trace),
         "client_arch": platform.machine(),

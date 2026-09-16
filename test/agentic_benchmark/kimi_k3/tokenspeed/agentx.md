@@ -159,7 +159,10 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
 ## Evidence and acceptance
 
 - `manifest.json`: client module hash, package versions, trace hash, launcher hash,
-  harness revision and explicit run settings. The harness commit identifies the
+  result auditor hash (`auditor_sha256`), harness revision and explicit run settings.
+  The auditor hash records the contents of `agentx_result.py` at preparation time,
+  including uncommitted edits that the harness revision cannot identify.
+  The harness commit identifies the
   launcher checkout, not necessarily the code installed in the server image.
   `server_configuration` also records `MODEL_DIR`, `DRAFT_DIR`, `SERVER_VENV`,
   `GPU_MEMORY_UTILIZATION`, `SERVER_SEED`, and optional `MODEL_REVISION` /
@@ -191,7 +194,8 @@ Tests use fake Slurm/HTTP commands to exercise port conflicts, startup failure,
 client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
 execution and hold, and cleanup isolation. Client-stage tests include a child
 process and verify both processes stop before the harness exits.
-They also check that changes to server parameters are recorded. No GPU allocation
+They also check that changes to server parameters and uncommitted result auditor
+edits are recorded. No GPU allocation
 is created.
 
 

@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -31,6 +32,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).parent
 SPEC = importlib.util.spec_from_file_location(
@@ -41,6 +43,89 @@ SPEC.loader.exec_module(RESULT)
 
 
 class ManifestTest(unittest.TestCase):
+    def test_manifest_identifies_uncommitted_auditor_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auditor = root / "agentx_result.py"
+            auditor.write_bytes((ROOT / "agentx_result.py").read_bytes())
+            for name in (
+                "agentx.slurm",
+                "server.sh",
+                "traces.jsonl",
+                "adapter.py",
+                "timing/phase/runner.py",
+                "credit/callback_handler.py",
+            ):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            (root / "scenario.json").write_text('{"name":"agentx","mode":"smoke"}')
+            environment = dict.fromkeys(
+                (
+                    "CONTAINER_IMAGE",
+                    "CONTAINER_MOUNTS",
+                    "CLIENT_PYTHON",
+                    "MODEL_NAME",
+                    "TOKENIZER_PATH",
+                    "CONCURRENCY",
+                    "SEED",
+                    "API_PORT",
+                    "READINESS_PATH",
+                    "READINESS_TIMEOUT",
+                    "HOLD_AFTER_RUN",
+                    "SLURM_JOB_ID",
+                ),
+                "test",
+            )
+            environment.update(
+                SOURCE_ROOT=str(root),
+                SERVER_SCRIPT=str(root / "server.sh"),
+                DATASET_PATH=str(root),
+                DURATION="60",
+                CLIENT_TIMEOUT="120",
+            )
+            evalscope = MagicMock()
+            adapter = evalscope.perf.scenarios.agentx
+            adapter.__file__ = str(root / "adapter.py")
+            scenario = adapter.AgentXScenario.model_validate_json.return_value
+            scenario.mode = "smoke"
+            scenario.model_dump.return_value = {"name": "agentx", "mode": "smoke"}
+            aiperf = MagicMock()
+            aiperf.__file__ = str(root / "__init__.py")
+            modules = {
+                "evalscope": evalscope,
+                "evalscope.perf": evalscope.perf,
+                "evalscope.perf.scenarios": evalscope.perf.scenarios,
+                "evalscope.perf.scenarios.agentx": adapter,
+                "aiperf": aiperf,
+            }
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.dict(sys.modules, modules),
+                patch.object(RESULT, "__file__", str(auditor)),
+                patch.object(
+                    RESULT.subprocess, "check_output", return_value="same-commit"
+                ),
+                patch.object(RESULT.importlib.metadata, "version", return_value="test"),
+            ):
+                RESULT.prepare(root)
+                before = json.loads((root / "manifest.json").read_text())
+                self.assertEqual(
+                    before["auditor_sha256"],
+                    hashlib.sha256(auditor.read_bytes()).hexdigest(),
+                )
+                with auditor.open("a") as stream:
+                    stream.write("\n# Local auditor modification without a commit.\n")
+                RESULT.prepare(root)
+                after = json.loads((root / "manifest.json").read_text())
+            self.assertEqual(before["harness_commit"], after["harness_commit"])
+            self.assertEqual(before["harness_sha256"], after["harness_sha256"])
+            self.assertNotEqual(before["auditor_sha256"], after["auditor_sha256"])
+            self.assertEqual(
+                after["auditor_sha256"],
+                hashlib.sha256(auditor.read_bytes()).hexdigest(),
+            )
+
     def test_server_parameters_are_recorded_without_mandating_a_launcher(self):
         environment = dict(
             MODEL_DIR="/models/target",
@@ -187,6 +272,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 root = Path(os.environ["TEST_ROOT"])
 role = "worker" if len(sys.argv) > 1 else "client"
