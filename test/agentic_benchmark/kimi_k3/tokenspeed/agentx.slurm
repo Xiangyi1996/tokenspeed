@@ -61,22 +61,13 @@ cp -- "${BASH_SOURCE[0]}" "$RUN_ROOT/harness.slurm"
 cp "$SCENARIO_FILE" "$RUN_ROOT/scenario.json"
 mkdir "$RUN_ROOT/dataset"
 cp -- "$DATASET_PATH/traces.jsonl" "$RUN_ROOT/dataset/traces.jsonl"
-"$CLIENT_PYTHON" "$SCRIPT_DIR/agentx_result.py" prepare "$RUN_ROOT"
-scontrol show job "$SLURM_JOB_ID" > "$RUN_ROOT/allocation.txt"
-mapfile -t NODES < <(scontrol show hostnames "$(squeue -h -j "$SLURM_JOB_ID" -o '%N')")
-[[ "${#NODES[@]}" -gt 0 ]]
-export HEAD="${NODES[0]}"
-BASE_URL="http://${HEAD}:${API_PORT}"
-# Any HTTP response on this port means another service owns it.
-if curl --silent --max-time 3 --output /dev/null "$BASE_URL/v1/models"; then
-    echo 'API port already occupied; refusing to use or stop that service' >&2
-    exit 1
-fi
+cp -- "$SCRIPT_DIR/agentx_result.py" "$RUN_ROOT/agentx_result.py"
 export NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 STEP_NAME="agentx_server_${SLURM_JOB_ID}_$$"
 SERVER_PID=
 PREFLIGHT_PID=
 CLIENT_PID=
+AUDITOR_PID=
 CLIENT_SIGNAL=TERM
 finish() {
     local result=$?
@@ -93,6 +84,11 @@ finish() {
         kill -TERM "$PREFLIGHT_PID" 2>/dev/null || true
         wait "$PREFLIGHT_PID" 2>/dev/null || true
         PREFLIGHT_PID=
+    fi
+    if [[ -n "$AUDITOR_PID" ]]; then
+        kill -TERM "$AUDITOR_PID" 2>/dev/null || true
+        wait "$AUDITOR_PID" 2>/dev/null || true
+        AUDITOR_PID=
     fi
     # While holding, a signal requests release through this same cleanup path.
     # Do not exit from a signal handler after removing the EXIT trap.
@@ -121,6 +117,25 @@ finish() {
 trap finish EXIT
 trap 'HOLD_AFTER_RUN=0; CLIENT_SIGNAL=INT; exit 130' INT
 trap 'HOLD_AFTER_RUN=0; CLIENT_SIGNAL=TERM; exit 143' TERM
+run_auditor() {
+    local auditor_result=0
+    "$CLIENT_PYTHON" "$RUN_ROOT/agentx_result.py" "$1" "$RUN_ROOT" &
+    AUDITOR_PID=$!
+    wait "$AUDITOR_PID" || auditor_result=$?
+    AUDITOR_PID=
+    return "$auditor_result"
+}
+run_auditor prepare
+scontrol show job "$SLURM_JOB_ID" > "$RUN_ROOT/allocation.txt"
+mapfile -t NODES < <(scontrol show hostnames "$(squeue -h -j "$SLURM_JOB_ID" -o '%N')")
+[[ "${#NODES[@]}" -gt 0 ]]
+export HEAD="${NODES[0]}"
+BASE_URL="http://${HEAD}:${API_PORT}"
+# Any HTTP response on this port means another service owns it.
+if curl --silent --max-time 3 --output /dev/null "$BASE_URL/v1/models"; then
+    echo 'API port already occupied; refusing to use or stop that service' >&2
+    exit 1
+fi
 SRUN=(srun --jobid="$SLURM_JOB_ID" --overlap --nodes="${#NODES[@]}" --ntasks-per-node=1
     --container-image="$CONTAINER_IMAGE" --container-name="agentx_${SLURM_JOB_ID}_$$"
     --container-mounts="$CONTAINER_MOUNTS" --container-workdir="$SOURCE_ROOT"
@@ -162,7 +177,7 @@ CLIENT_RESULT=0
 wait "$CLIENT_PID" || CLIENT_RESULT=$?
 CLIENT_PID=
 if (( CLIENT_RESULT != 0 )); then exit "$CLIENT_RESULT"; fi
-"$CLIENT_PYTHON" "$SCRIPT_DIR/agentx_result.py" audit "$RUN_ROOT"
+run_auditor audit
 
 # A controller may retain a successful service for additional client runs.
 if [[ -f "$RUN_ROOT/hold-after-client" ]]; then HOLD_AFTER_RUN=1; fi

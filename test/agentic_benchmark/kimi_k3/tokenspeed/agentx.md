@@ -121,10 +121,13 @@ failure, until `touch "$RUN_ROOT/release-requested"`, server exit or allocation
 expiry. SIGINT/SIGTERM stops the invocation's server step. With `HOLD_AFTER_RUN=0`,
 only that step is stopped after the run; an independently held allocation survives.
 A directly submitted batch allocation ends when its batch script exits.
-A signal received during GPU preflight, server startup, client execution or hold
+A signal received during manifest preparation, GPU preflight, server startup,
+client execution, result auditing or hold
 exits with 130 (SIGINT) or 143 (SIGTERM) and records that code. The preflight runs
 as a tracked background child; cancellation terminates and reaps its `srun` before
 exiting. Preflight failure preserves its exit code and prevents server/client launch.
+Manifest preparation and result auditing also run as tracked children. Cancellation
+terminates and reaps them before server cleanup; preparation failure prevents launch.
 During a client run, the harness forwards
 the signal through GNU `timeout` to the client's process group and waits for it
 to exit before cleaning up its own server step. An unresponsive client is killed
@@ -170,8 +173,9 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
 
 - `manifest.json`: client module hash, package versions, trace hash, launcher hash,
   result auditor hash (`auditor_sha256`), harness revision and explicit run settings.
-  The auditor hash records the contents of `agentx_result.py` at preparation time,
-  including uncommitted edits that the harness revision cannot identify.
+  The auditor hash records the run-local `agentx_result.py` snapshot used for both
+  preparation and auditing. Later checkout edits cannot change the audit logic.
+  The snapshot includes uncommitted edits that the harness revision cannot identify.
   `harness_sha256` hashes `harness.slurm`, the snapshot of the executing script
   taken from `BASH_SOURCE[0]` before manifest preparation. For `sbatch`, this is
   the Slurm spool copy, even if the checkout changed while the job was queued.
@@ -185,6 +189,7 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
   in the manifest are provenance records, not a source-allowlist gate.
 - `allocation.txt`, `gpu-preflight.log`, `server.log`: allocation and server evidence.
 - `harness.slurm`: executing launcher snapshot corresponding to `harness_sha256`.
+- `agentx_result.py`: auditor snapshot corresponding to `auditor_sha256`.
 - `dataset/traces.jsonl`: client input snapshot corresponding to `dataset_sha256`.
   The manifest's `dataset_path` identifies the consumed directory;
   `environment.DATASET_PATH` retains the original source directory.
@@ -215,8 +220,10 @@ execution and hold, and cleanup isolation. Client-stage tests include a child
 process and verify both processes stop before the harness exits.
 They also check server parameters, uncommitted result auditor edits, execution
 from a spool copy that differs from the checkout, and replacement of the shared
-dataset after preparation without changing the client's snapshot. No GPU allocation
-is created.
+dataset after preparation without changing the client's snapshot. Auditor checkout
+replacement leaves preparation and auditing on the same snapshot. Preparation and
+audit failures and SIGINT/SIGTERM cancellation preserve exit codes and reap tracked
+children. No GPU allocation is created.
 
 
 ## Drain time

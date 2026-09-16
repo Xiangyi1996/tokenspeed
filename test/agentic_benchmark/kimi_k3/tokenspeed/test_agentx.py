@@ -251,6 +251,13 @@ class LifecycleTest(unittest.TestCase):
             "success",
             "spool_copy",
             "dataset_replaced",
+            "auditor_replaced",
+            "prepare_sigterm",
+            "prepare_sigint",
+            "prepare_failure",
+            "audit_sigterm",
+            "audit_sigint",
+            "audit_failure",
             "client_failure",
             "client_sigterm",
             "client_sigint",
@@ -294,6 +301,8 @@ exit 0""",
                     "scancel": '''echo "$*" >> "$TEST_ROOT/cancelled"
 case "$CASE" in client_sigterm|client_sigint|client_timeout)
     [ -f "$TEST_ROOT/client-stopped" ] || touch "$TEST_ROOT/premature-server-cleanup" ;;
+audit_sigterm|audit_sigint)
+    [ -f "$TEST_ROOT/audit-stopped" ] || touch "$TEST_ROOT/premature-server-cleanup" ;;
 esac
 [ "$1" = 123.1 ] && kill "$(cat "$TEST_ROOT/server-pid")"''',
                     "curl": """if [ "$CASE" = occupied ]; then exit 0; fi
@@ -306,8 +315,16 @@ echo "{}"
  printf '%s\\0' "$@" > "$TEST_ROOT/client-arguments"
  case "$CASE" in client_sigterm|client_sigint|client_timeout) exec "$TEST_PYTHON" "$TEST_ROOT/client.py" ;; esac
  if [ "$CASE" = hold_marker ]; then touch "$RUN_ROOT/hold-after-client"; fi
+ if [ "$CASE" = auditor_replaced ]; then echo '# Changed checkout auditor' > "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/agentx_result.py"; fi
  [ "$CASE" != client_failure ]
-else exit 0
+else
+ printf '%s' "$1" > "$TEST_ROOT/$2-path"
+ cp "$1" "$TEST_ROOT/$2-auditor"
+ case "$2:$CASE" in
+ prepare:prepare_sigterm|prepare:prepare_sigint|audit:audit_sigterm|audit:audit_sigint) exec "$TEST_PYTHON" "$TEST_ROOT/pending_srun.py" "$2" ;;
+ prepare:prepare_failure|audit:audit_failure) exit 29 ;;
+ esac
+ exit 0
 fi""",
                 }
                 for name, body in scripts.items():
@@ -352,6 +369,8 @@ from pathlib import Path
 
 root = Path(os.environ["TEST_ROOT"])
 role = "server" if len(sys.argv) > 1 else "preflight"
+if len(sys.argv) > 1 and sys.argv[1] in ("prepare", "audit"):
+    role = sys.argv[1]
 
 def stop(signum, frame):
     (root / (role + "-stopped")).write_text(str(signum))
@@ -380,6 +399,15 @@ while True:
                 trace_content = b'{"trace": "original"}\n'
                 (root / "traces.jsonl").write_bytes(trace_content)
                 run = root / "output"
+                source_root = ROOT.parents[3]
+                if case == "auditor_replaced":
+                    source_root = root / "checkout"
+                    source_auditor = (
+                        source_root
+                        / "test/agentic_benchmark/kimi_k3/tokenspeed/agentx_result.py"
+                    )
+                    source_auditor.parent.mkdir(parents=True)
+                    source_auditor.write_bytes((ROOT / "agentx_result.py").read_bytes())
                 env = dict(
                     os.environ,
                     PATH=str(binaries) + os.pathsep + os.environ["PATH"],
@@ -387,7 +415,7 @@ while True:
                     TEST_PYTHON=sys.executable,
                     CASE=case,
                     SLURM_JOB_ID="123",
-                    SOURCE_ROOT=str(ROOT.parents[4]),
+                    SOURCE_ROOT=str(source_root),
                     SERVER_SCRIPT=str(server),
                     CONTAINER_IMAGE="test-image",
                     CONTAINER_MOUNTS="/tmp:/tmp",
@@ -419,6 +447,11 @@ while True:
                             "preflight_sigterm",
                             "preflight_sigint",
                             "preflight_failure",
+                            "prepare_sigterm",
+                            "prepare_sigint",
+                            "prepare_failure",
+                            "audit_sigterm",
+                            "audit_sigint",
                         )
                         else "0"
                     ),
@@ -440,6 +473,25 @@ while True:
                     text=True,
                 )
                 try:
+                    if case in (
+                        "prepare_sigterm",
+                        "prepare_sigint",
+                        "audit_sigterm",
+                        "audit_sigint",
+                    ):
+                        role = case.split("_")[0]
+                        deadline = time.monotonic() + 5
+                        while (
+                            not (root / (role + "-ready")).exists()
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        self.assertTrue((root / (role + "-ready")).exists())
+                        process.send_signal(
+                            signal.SIGTERM
+                            if case.endswith("sigterm")
+                            else signal.SIGINT
+                        )
                     if case in ("preflight_sigterm", "preflight_sigint"):
                         deadline = time.monotonic() + 5
                         while (
@@ -505,6 +557,7 @@ while True:
                             "success",
                             "spool_copy",
                             "dataset_replaced",
+                            "auditor_replaced",
                             "hold",
                             "hold_marker",
                         ),
@@ -550,6 +603,11 @@ while True:
                         self.assertFalse((root / "cancelled").exists())
                         self.assertFalse((root / "client-called").exists())
                         self.assertFalse((run / "allocation-held.txt").exists())
+                    elif case.startswith("prepare"):
+                        self.assertFalse((root / "server-pid").exists())
+                        self.assertFalse((root / "step").exists())
+                        self.assertFalse((root / "cancelled").exists())
+                        self.assertFalse((root / "client-called").exists())
                     elif case.startswith("preflight"):
                         if case == "preflight_failure":
                             self.assertEqual(process.returncode, 23)
@@ -573,6 +631,42 @@ while True:
                     else:
                         self.assertEqual(
                             (root / "cancelled").read_text().splitlines(), ["123.1"]
+                        )
+                    if (
+                        case.startswith(("prepare", "audit"))
+                        and case != "auditor_replaced"
+                    ):
+                        role = case.split("_")[0]
+                        if case.endswith("failure"):
+                            self.assertEqual(process.returncode, 29)
+                            self.assertEqual(
+                                (run / "client-exit-code.txt").read_text().strip(), "29"
+                            )
+                        else:
+                            self.assertEqual(
+                                int((root / (role + "-stopped")).read_text()),
+                                signal.SIGTERM,
+                            )
+                            with self.assertRaises(ProcessLookupError):
+                                os.kill(int((root / (role + "-pid")).read_text()), 0)
+                        self.assertFalse((run / "allocation-held.txt").exists())
+                        self.assertFalse((root / "premature-server-cleanup").exists())
+                    if case == "auditor_replaced":
+                        self.assertEqual(
+                            (root / "prepare-path").read_text(),
+                            str(run / "agentx_result.py"),
+                        )
+                        self.assertEqual(
+                            (root / "audit-path").read_text(),
+                            str(run / "agentx_result.py"),
+                        )
+                        self.assertEqual(
+                            (root / "prepare-auditor").read_bytes(),
+                            (root / "audit-auditor").read_bytes(),
+                        )
+                        self.assertNotEqual(
+                            source_auditor.read_bytes(),
+                            (root / "audit-auditor").read_bytes(),
                         )
                     self.assertEqual(
                         (run / "harness.slurm").read_bytes(),
@@ -619,7 +713,7 @@ while True:
                         process.kill()
                         process.communicate(timeout=5)
                     # Also reap the fake server if the behavior under test leaked it.
-                    for role in ("server", "preflight"):
+                    for role in ("server", "preflight", "prepare", "audit"):
                         if (root / (role + "-pid")).exists():
                             try:
                                 os.kill(
