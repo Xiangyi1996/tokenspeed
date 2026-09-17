@@ -33,9 +33,11 @@ path on shared storage does not make that Python executable cross-architecture.
 
 Prepare a local `traces.jsonl` from the fixed EvalScope 256K dataset; retain its
 revision and SHA256. Use the same file for both engines. A smoke run still uses
-long context: the server must support 262144 tokens. The supplied
-`configs/agentx_tp8.sh` follows the existing TP8/Eagle3 configuration, with 256K
-context, an explicit seed and GPU memory fraction, and KVStore disabled.
+long context: the server must support 262144 tokens. Reuse the existing
+`configs/attn_tp8_moe_tp8.sh` or `configs/attn_tp8_moe_ep8.sh` for the chosen
+parallelism layout. Both accept extra arguments through `"$@"`, preserving their
+existing settings when called without overrides. AgentX passes its context,
+checkpoint paths, seed and other run-specific choices as explicit arguments.
 
 Create `/absolute/path/to/scenario.json`:
 
@@ -62,7 +64,7 @@ artifacts in a public commit.
 
 ```bash
 export SOURCE_ROOT=/absolute/path/to/tokenspeed
-export SERVER_SCRIPT="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/configs/agentx_tp8.sh"
+export SERVER_SCRIPT="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/configs/attn_tp8_moe_tp8.sh"
 export CONTAINER_IMAGE=/absolute/path/to/pinned-server.sqsh
 export CONTAINER_MOUNTS=/shared:/shared
 export SERVER_VENV=/opt/server-venv
@@ -86,7 +88,32 @@ export READINESS_TIMEOUT=7500
 export CLIENT_TIMEOUT=3300
 export HOLD_AFTER_RUN=1
 export RUN_ROOT=/shared/new-agentx-output
+
+SERVER_ARGS=(
+  --model "$MODEL_DIR"
+  --served-model-name "$MODEL_NAME"
+  --speculative-draft-model-path "$DRAFT_DIR"
+  --max-model-len 262144
+  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  --seed "$SERVER_SEED"
+  --port "$API_PORT"
+  --engine-startup-timeout "$READINESS_TIMEOUT"
+  --disable-kvstore
+  --enable-cache-report
+)
 ```
+
+Arguments after `agentx.slurm` are forwarded unchanged to the selected server
+script, not to EvalScope. The shared TokenSpeed configs append those arguments
+to `ts serve`, so the supplied scalar options override the existing values.
+Select `attn_tp8_moe_ep8.sh` instead to test Attention TP8 / MoE EP8; no separate
+AgentX copy of either config is needed. Validate each chosen layout with a smoke
+run before benchmarking it.
+
+The harness activates `SERVER_VENV` inside the server container before executing
+the script. Set it to an empty string explicitly for a system-Python image or a
+custom launcher that manages its own environment. Client environment activation
+is independent and is not affected by this server-only activation.
 
 `RUN_ROOT` must not exist and its parent must exist. `mkdir` reserves it atomically.
 Before preparing the manifest, the harness copies `DATASET_PATH/traces.jsonl` to
@@ -103,7 +130,7 @@ For a native client on the allocated node:
 ```bash
 sbatch --nodes=2 --ntasks-per-node=1 --gres=gpu:4 --exclusive \
   --partition=very-long --time=06:00:00 --no-requeue --export=ALL \
-  "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm"
+  "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm" "${SERVER_ARGS[@]}"
 ```
 
 Adapt account, partition, mounts, image and time limit to the cluster. The example
@@ -113,7 +140,7 @@ Alternatively, on a login host with an already held allocation:
 
 ```bash
 export SLURM_JOB_ID=YOUR_HELD_JOB_ID
-bash "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm"
+bash "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm" "${SERVER_ARGS[@]}"
 ```
 
 With `HOLD_AFTER_RUN=1`, the server remains available after client success or
@@ -165,6 +192,9 @@ scenario engine/version accordingly, and use the same served model name.
 The reference's 80000 context must be raised to 262144 for this dataset.
 Validate K3 modelopt checkpoint support and Eagle3 support in the exact vLLM
 image before a long benchmark; image tags alone are not evidence of compatibility.
+Supply that launcher's own arguments rather than the TokenSpeed `SERVER_ARGS`
+above: option names are engine-specific. Custom launchers can also be called
+without extra arguments if they already obtain their settings from the environment.
 For a system-Python launcher set `SERVER_VENV=''` explicitly. Both launchers must
 declare `MODEL_DIR`, `DRAFT_DIR`, their immutable revisions, the effective
 `GPU_MEMORY_UTILIZATION` and `SERVER_SEED`, even when their command construction
@@ -196,6 +226,10 @@ differs. Set scenario `engine_version` to the actual runtime revision/version.
   retains the original path. Custom launchers must resolve assets through absolute
   paths or `SOURCE_ROOT`, since their script location is now `RUN_ROOT`; the container working directory
   remains `SOURCE_ROOT`.
+- `manifest.json.server_arguments`: ordered argument list passed to the server
+  snapshot. Argument boundaries, including paths with spaces, are preserved;
+  arguments are never evaluated as shell code. Together with `server.sh` and
+  `server_configuration.SERVER_VENV`, this records the selected config and overrides.
 - `dataset/traces.jsonl`: client input snapshot corresponding to `dataset_sha256`.
   The manifest's `dataset_path` identifies the consumed directory;
   `environment.DATASET_PATH` retains the original source directory.
@@ -215,28 +249,11 @@ cancellation; report it explicitly and do not count its partial output as succes
 submission. Report warmup separately and distinguish aggregate output throughput,
 per-user decode throughput and request E2E throughput.
 
-## Local tests
+## Shell syntax check
 
 ```bash
-python test/agentic_benchmark/kimi_k3/tokenspeed/test_agentx.py
 bash -n test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm
 ```
-
-Tests use fake Slurm/HTTP commands to exercise port conflicts, preflight failure,
-SIGINT/SIGTERM during preflight, startup failure,
-SIGINT/SIGTERM and readiness timeout before server step registration,
-client failure, client timeout, hold/release, SIGINT/SIGTERM during both client
-execution and hold, and cleanup isolation. Client-stage tests include a child
-process and verify both processes stop before the harness exits.
-They also check server parameters, uncommitted result auditor edits, execution
-from a spool copy that differs from the checkout, and replacement of the shared
-dataset after preparation without changing the client's snapshot. Auditor checkout
-replacement leaves preparation and auditing on the same snapshot. Preparation and
-audit failures and SIGINT/SIGTERM cancellation preserve exit codes and reap tracked
-children. Snapshot-copy cancellation and failure prevent server launch; replacing
-the server source during preflight leaves the executed launcher snapshot unchanged.
-No GPU allocation is created.
-
 
 ## Drain time
 

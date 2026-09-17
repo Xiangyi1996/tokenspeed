@@ -23,10 +23,12 @@
 
 # Run via sbatch with a native client, or from the login host in a held job.
 # All paths must be absolute and visible where they are used. See agentx.md.
+# Arguments after this script are passed unchanged to the server configuration.
 set -euo pipefail
 : "${SLURM_JOB_ID:?use sbatch or an existing allocation}"
 : "${SOURCE_ROOT:?absolute checkout path; independent of sbatch submit directory}"
 : "${SERVER_SCRIPT:?absolute per-node server launcher path}"
+: "${SERVER_VENV?server venv path; set empty to use the image environment}"
 : "${CONTAINER_IMAGE:?pinned server image}"
 : "${CONTAINER_MOUNTS:?explicit shared mounts}"
 : "${CLIENT_PYTHON:?absolute Python from the native EvalScope agentx venv}"
@@ -126,7 +128,7 @@ mkdir "$RUN_ROOT/dataset"
 run_tracked cp -- "$DATASET_PATH/traces.jsonl" "$RUN_ROOT/dataset/traces.jsonl"
 run_tracked cp -- "$SCRIPT_DIR/agentx_result.py" "$RUN_ROOT/agentx_result.py"
 run_tracked cp -- "$SERVER_SCRIPT" "$RUN_ROOT/server.sh"
-run_tracked "$CLIENT_PYTHON" "$RUN_ROOT/agentx_result.py" prepare "$RUN_ROOT"
+run_tracked "$CLIENT_PYTHON" "$RUN_ROOT/agentx_result.py" prepare "$RUN_ROOT" "$@"
 scontrol show job "$SLURM_JOB_ID" > "$RUN_ROOT/allocation.txt"
 mapfile -t NODES < <(scontrol show hostnames "$(squeue -h -j "$SLURM_JOB_ID" -o '%N')")
 [[ "${#NODES[@]}" -gt 0 ]]
@@ -153,7 +155,11 @@ wait "$PREFLIGHT_PID" || PREFLIGHT_RESULT=$?
 PREFLIGHT_PID=
 if (( PREFLIGHT_RESULT != 0 )); then exit "$PREFLIGHT_RESULT"; fi
 "${SRUN[@]}" --job-name="$STEP_NAME" --mpi=pmix --kill-on-bad-exit=1 \
-    bash "$RUN_ROOT/server.sh" > "$RUN_ROOT/server.log" 2>&1 &
+    bash -c '
+        set -euo pipefail
+        if [[ -n "$SERVER_VENV" ]]; then source "$SERVER_VENV/bin/activate"; fi
+        exec bash "$RUN_ROOT/server.sh" "$@"
+    ' agentx-server "$@" > "$RUN_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 START=$SECONDS
 until curl --fail --silent --max-time 5 --output /dev/null "$BASE_URL$READINESS_PATH"; do

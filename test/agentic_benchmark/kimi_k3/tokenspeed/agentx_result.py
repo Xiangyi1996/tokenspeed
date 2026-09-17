@@ -55,7 +55,7 @@ def server_configuration(environment):
     }
 
 
-def prepare(run_root):
+def prepare(run_root, server_arguments):
     from evalscope.perf.scenarios.agentx import AgentXScenario
 
     scenario = AgentXScenario.model_validate_json(
@@ -100,6 +100,7 @@ def prepare(run_root):
         "environment": environment,
         "scenario": scenario.model_dump(),
         "server_configuration": server,
+        "server_arguments": server_arguments,
         "harness_commit": commit,
         "harness_sha256": file_sha256(run_root / "harness.slurm"),
         "auditor_sha256": file_sha256(Path(__file__)),
@@ -188,12 +189,14 @@ def audit(summary, records, log_text):
     }
 
 
-def main(operation, run_root):
+def main(operation, run_root, server_arguments):
     if operation == "prepare":
-        prepare(run_root)
+        prepare(run_root, server_arguments)
         return
     if operation != "audit":
         raise ValueError("Expected prepare or audit")
+    if server_arguments:
+        raise ValueError("Server arguments are only accepted by prepare")
     log_text = ""
     try:
         paths = list((run_root / "client").rglob("agentx_summary.json"))
@@ -228,4 +231,4 @@ def main(operation, run_root):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], Path(sys.argv[2]))
+    main(sys.argv[1], Path(sys.argv[2]), sys.argv[3:])
