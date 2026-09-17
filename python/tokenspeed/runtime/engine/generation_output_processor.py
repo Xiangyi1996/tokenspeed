@@ -234,11 +234,12 @@ class RequestState:
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids_unpadded + self.output_ids
-        return (
-            all_ids[self._surr_offset :],
-            self._read_offset - self._surr_offset,
-        )
+        # Slice before concatenating: decode needs only the surrounding prompt
+        # suffix, not a copy of the entire cached prompt on every output token.
+        prompt = self.prompt_input_ids_unpadded
+        offset = self._surr_offset
+        decode_ids = prompt[offset:] + self.output_ids[max(offset - len(prompt), 0) :]
+        return decode_ids, self._read_offset - offset
 
     def check_finished(self, skip_grammar_termination: bool = False):
 
@@ -608,10 +609,19 @@ class OutputProcesser:
                 draft_width=self.spec_num_tokens - 1,
             )
 
-    def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:
-        for rid, prefix_len in zip(rids, extend_prefix_lens):
+    def add_cached_tokens(
+        self,
+        rids: list[str],
+        extend_prefix_lens: list[int],
+        extend_replay_lens: list[int],
+    ) -> None:
+        # Replayed rows re-feed cached positions: the hit reaches to the end of
+        # the replay window, not to where the model input starts.
+        for rid, prefix_len, replay_len in zip(
+            rids, extend_prefix_lens, extend_replay_lens
+        ):
             if rs := self.rid_to_state.get(rid):
-                rs.cached_tokens += max(0, prefix_len - rs.computed_length)
+                rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
 
     def post_process_forward_op(
         self,
@@ -622,6 +632,7 @@ class OutputProcesser:
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
+            forward_op.extend_replay_lens,
         )
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 

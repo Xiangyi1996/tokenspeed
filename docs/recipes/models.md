@@ -702,6 +702,12 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
+The decoder passes ordinary sublayer-output tensors and residual tuples between
+layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
+`combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
+PLE, deepstack updates and row-gather boundaries combine the residual first;
+the updated, unnormalized HC state remains available for MTP.
+
 ```bash
 ts serve \
     --model Qwen/Qwen3.8-Flash-Next-FP8 \
@@ -761,10 +767,14 @@ tokenspeed serve openai/gpt-oss-120b \
 
 ## DeepSeek V4-Flash / V4-Pro
 
-DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
-indexer cache. `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
+DeepSeek V4 uses FP8 KV cache.
+`tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
 and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override). Requires
+`--block-size N` with `N != 64` to override).
+
+### NVIDIA
+
+The NVIDIA recipes below require
 `tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
 
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
@@ -810,6 +820,53 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
 For the expert-parallel topology, swap `--tensor-parallel-size 8` for
 `--tensor-parallel-size 8 --enable-expert-parallel --dense-tp-size 1` and
 `--moe-backend flashinfer_trtllm` for `--moe-backend mega_moe`.
+
+### AMD
+
+**V4-Flash** — 2× MI350-series (gfx950), tensor-parallel + MTP:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-model-len 4096 \
+  --max-total-tokens 16384 \
+  --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+**V4-Flash** — 1× MI450-series (gfx1250), Triton + decode/prefill graphs, without MTP:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+  --served-model-name deepseek-v4-flash \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend triton \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 4096 \
+  --max-total-tokens 8192 \
+  --max-num-seqs 4 \
+  --chunked-prefill-size 256 \
+  --gpu-memory-utilization 0.8 \
+  --disable-kvstore \
+  --max-cudagraph-capture-size 4 \
+  --cudagraph-capture-sizes 1 2 3 4 \
+  --prefill-graph-max-tokens 256 \
+  --prefill-graph-capture-sizes 128 256 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+MTP is not yet validated on MI450.
 
 ### MTP speculative decoding
 
@@ -891,6 +948,57 @@ for explicit topology flags and launcher-derived settings. Before applying
 production load, confirm that every rank reports a nonzero Prefix Replay window,
 then check completion, speculative acceptance, and cache-hit metrics with fixed
 prompts and package/model revisions.
+
+## DeepSeek V4.1-Flash
+
+DeepSeek V4.1 (`deepseek_v41`) is served by its own FlatKV attention backend
+with a four-group KV cache: the global KV chains, the SWA rows and the
+compressor tails. The recipe declares the last two **replayable**
+(`replay_window_tokens`): they never enter the prefix cache, and a prefix
+hit re-feeds the cached prefix's last 128 tokens so the model regenerates
+them into the request's own pages (SWA bounded replay,
+[`docs/design/scheduler.md` §1.3](../design/scheduler.md#13-bounded-replay)).
+The global KV and index rows those replayed tokens recompute are masked, so
+the shared rows stay exactly what the first computation produced. The CED
+decoder (layers 20–39) runs only on each prompt's last 128 positions
+(one row per chunk that does not complete its prompt), which is why the
+backend declares `prefill_graph=False`: the prefill row count changes at
+layer 20. Pass `--disable-prefill-graph` explicitly or let the backend
+resolution turn it off; decode CUDA graphs are unaffected.
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v41-flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend marlin \
+  --dtype bfloat16 \
+  --max-model-len 32768 \
+  --max-total-tokens 262144 \
+  --max-num-seqs 32 \
+  --chunked-prefill-size 8192 \
+  --max-cudagraph-capture-size 32 \
+  --disable-prefill-graph \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
+the draft seeds its context windows from the decoder's kept rows. A hit
+re-feeds the groups' whole retention window (the 128-token attention window
+plus the admission protection, a few verify widths); the scheduler requires
+`--chunked-prefill-size` of at least that window plus one prefix page and
+never leaves a prompt's final chunk shorter than it. The replayed rows attend
+SWA keys from the replay start only, the truncation the model is trained
+for; the cached global KV is never recomputed from them.
+`usage.prompt_tokens_details.cached_tokens` reports the hit through the end
+of the replayed window, so it stays a multiple of the prefix granularity.
+Under prefill/decode disaggregation the prefill node replays on its own
+prefix hits exactly as above and ships each group's retained tail; the
+decode node lands the tail and never re-feeds. Even on one machine, let
+Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
 
 ## Tuning Order
 

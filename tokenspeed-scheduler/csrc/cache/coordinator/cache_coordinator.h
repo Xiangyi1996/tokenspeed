@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -33,6 +34,7 @@
 #include "cache/coordinator/group_geometry.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -57,12 +59,28 @@ public:
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                     BlockPool* host_pool, bool stream_device_cache_to_host);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
     bool HasMambaStateGroup() const;
+    // A replayable group (CacheGroupSpec::replay_window > 0) is regenerated
+    // by the model from re-fed prompt tokens instead of being prefix-cached:
+    // it takes no part in matching or publication on either tier, and Admit
+    // materializes it from the replay window before a hit. Retention still
+    // slides its request-private pages out.
+    bool GroupIsReplayable(std::int32_t i) const {
+        return groups_[static_cast<std::size_t>(i)].Spec().replay_window > 0;
+    }
+    // Largest replay window over all groups; 0 when none is replayable.
+    std::int32_t ReplayWindowTokens() const noexcept { return replay_window_tokens_; }
+    // Tokens re-fed ahead of a prefix hit so every replayable group resumes
+    // there: the window before the hit, or the whole hit when shorter.
+    std::int32_t ReplayTokens(std::int32_t hit_tokens) const {
+        _assert(hit_tokens >= 0, "hit tokens must be non-negative");
+        return std::min(replay_window_tokens_, hit_tokens);
+    }
 
     GroupAllocator& Allocator(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Allocator(); }
     const GroupAllocator& Allocator(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Allocator(); }
@@ -138,7 +156,7 @@ public:
     PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+                                         std::optional<std::uint64_t> request_access_epoch);
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
     // arithmetic stays behind these methods.
@@ -165,12 +183,12 @@ public:
     // Registers an exact range, used for transferred prefix blocks and tests.
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot = 0,
-                         CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
+                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
     void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                               std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
                               std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
-                              bool stream_completed_to_host, std::int32_t materialized_state_boundary_tokens);
+                              bool stream_completed_to_host,
+                              std::span<const std::int32_t> materialized_state_boundaries);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -249,7 +267,7 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host = false);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
@@ -263,11 +281,13 @@ private:
     // Per-group token -> page arithmetic, aligned with groups_.
     std::vector<GroupGeometry> geometry_;
     // Closed groups first, so non-closed groups match against a settled bound.
+    // Replayable groups are absent: they neither constrain nor claim a hit.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
     std::int32_t prefix_granularity_{0};
+    std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
@@ -276,7 +296,6 @@ private:
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, BlockPool* host_pool = nullptr,
-                                 bool stream_device_cache_to_host = true);
+                                 BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host);
 
 }  // namespace tokenspeed

@@ -139,9 +139,10 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
-    std::optional<CacheCoordinator::AdmissionResult> admit(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, CacheCoordinator::PrefixProbe&& prefix,
-        std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                           CacheCoordinator::PrefixProbe&& prefix,
+                                                           std::span<const GroupDemand> demands,
+                                                           std::optional<std::uint64_t> request_access_epoch);
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            std::span<const GroupDemand> demands,
                                                            std::uint64_t request_access_epoch);
@@ -195,9 +196,9 @@ private:
         // the same candidates -- its first decode is next round's work).
         std::unordered_set<const Request*> scheduled;
         std::int32_t token_budget{0};
-        // Budget the decode batch must leave untouched: one state-checkpoint
-        // page for a pending local mamba prefill, which cannot advance in
-        // sub-page chunks (fused mixed mode only).
+        // Budget the decode batch must leave untouched for a pending local
+        // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
+        // fused mixed mode only).
         std::int32_t state_prefill_reserve{0};
         bool pushed_prefill{false};
         bool pushed_decode{false};
