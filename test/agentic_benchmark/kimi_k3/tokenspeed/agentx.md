@@ -64,7 +64,7 @@ artifacts in a public commit.
 
 ```bash
 export SOURCE_ROOT=/absolute/path/to/tokenspeed
-export SERVER_SCRIPT="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/configs/attn_tp8_moe_tp8.sh"
+export CONFIG_NAMES="attn_tp8_moe_tp8 attn_tp8_moe_ep8"
 export CONTAINER_IMAGE=/absolute/path/to/pinned-server.sqsh
 export CONTAINER_MOUNTS=/shared:/shared
 export SERVER_VENV=/opt/server-venv
@@ -86,7 +86,6 @@ export API_PORT=8000
 export READINESS_PATH=/readiness
 export READINESS_TIMEOUT=7500
 export CLIENT_TIMEOUT=3300
-export HOLD_AFTER_RUN=1
 export RUN_ROOT=/shared/new-agentx-output
 
 SERVER_ARGS=(
@@ -117,7 +116,7 @@ is independent and is not affected by this server-only activation.
 
 `RUN_ROOT` must not exist and its parent must exist. `mkdir` reserves it atomically.
 Before preparing the manifest, the harness copies `DATASET_PATH/traces.jsonl` to
-`RUN_ROOT/dataset/traces.jsonl`. Both the manifest hash and client use this run-local
+`RUN_ROOT/<config>/dataset/traces.jsonl`. Both the manifest hash and client use this run-local
 snapshot, so replacing the shared source during server startup cannot change the
 workload. Allow disk space for one trace copy per run and preserve this artifact.
 The harness rejects an occupied HTTP port or GPUs before launching its server.
@@ -143,13 +142,21 @@ export SLURM_JOB_ID=YOUR_HELD_JOB_ID
 bash "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/agentx.slurm" "${SERVER_ARGS[@]}"
 ```
 
-With `HOLD_AFTER_RUN=1`, the server remains available after client success or
-failure, until `touch "$RUN_ROOT/release-requested"`, server exit or allocation
-expiry. SIGINT/SIGTERM stops the invocation's server step. With `HOLD_AFTER_RUN=0`,
-only that step is stopped after the run; an independently held allocation survives.
-A directly submitted batch allocation ends when its batch script exits.
+Each invocation iterates over `CONFIG_NAMES` in order, using the existing server
+configs. Set a single name to run only one configuration. Each configuration starts
+a fresh server, runs the same AgentX scenario and concurrency, audits the result,
+and stops its server before advancing. Any failure stops the sweep. Results live
+under `RUN_ROOT/<config>/`; duplicate configuration names are rejected.
+
+The main flow is a `for CONFIG` loop around `prepare_run`, `setup_slurm`,
+`check_resources`, `launch_server`, `wait_for_ready`, `run_benchmark`,
+`audit_results`, and `stop_server`. The exit trap handles failure and cancellation.
+Allocation holding can remain outside the script: an independently held allocation
+survives, while a directly submitted batch allocation ends when the script exits.
+The launcher does not consume `HOLD_AFTER_RUN` or service-hold marker files.
+
 A signal received during snapshot copying, manifest preparation, GPU preflight, server startup,
-client execution, result auditing or hold
+client execution or result auditing
 exits with 130 (SIGINT) or 143 (SIGTERM) and records that code. The preflight runs
 as a tracked background child; cancellation terminates and reaps its `srun` before
 exiting. Preflight failure preserves its exit code and prevents server/client launch.
@@ -159,14 +166,9 @@ terminates and reaps them before server cleanup; copy or preparation failure pre
 During a client run, the harness forwards
 the signal through GNU `timeout` to the client's process group and waits for it
 to exit before cleaning up its own server step. An unresponsive client is killed
-after the existing 45-second kill-after interval. Cancellation skips service hold
-even when `HOLD_AFTER_RUN=1`. The separate
-held allocation and unrelated steps remain intact.
+after the existing 45-second kill-after interval. The separate held allocation and unrelated steps remain intact.
 Cleanup also sends SIGTERM to the tracked server `srun` before waiting for it.
 This covers cancellation or readiness failure before its step appears in `squeue`.
-A controller can also create `RUN_ROOT/hold-after-client` before a successful
-client audit to retain that service for more client runs; the same
-`release-requested` mechanism applies. This marker does not retain failed runs.
 
 ## Benchmark and compare engines
 
@@ -174,7 +176,7 @@ For a formal run, set scenario `mode` to `benchmark`, `DURATION=1800`, and selec
 a new `RUN_ROOT`. Benchmark mode requires at least 900 seconds. `CLIENT_TIMEOUT`
 must also cover dataset reconstruction, warmup and draining; check remaining job
 time before starting. Do not compare a warmed smoke result with a cold baseline.
-Each fresh harness invocation starts a new server, while the protocol's warmup
+Each configuration starts a new server, while the protocol's warmup
 still runs. Verify the first warmup's cache-read count when asserting cold KV state.
 
 `CONCURRENCY` is the root session-tree limit; child agents may run concurrently.
@@ -183,22 +185,11 @@ GPU count, KV precision, memory fraction, idle cap and drain rules aligned.
 Record differences in attention/MoE backends and engine-specific features rather
 than treating them as matched. Change one engine at a time on the same nodes.
 
-For vLLM, provide a `SERVER_SCRIPT` that uses its verified native Python and launches
-one task per node. A system-Python image does not need venv activation; do not
-activate the TokenSpeed venv in a vLLM image. Follow the K3 vLLM reference's native multi-node arguments:
-`--nnodes "$SLURM_NNODES" --node-rank "$SLURM_NODEID" --master-addr "$HEAD"`,
-adding `--headless` only on followers. Use `/health` as `READINESS_PATH`, set the
-scenario engine/version accordingly, and use the same served model name.
-The reference's 80000 context must be raised to 262144 for this dataset.
-Validate K3 modelopt checkpoint support and Eagle3 support in the exact vLLM
-image before a long benchmark; image tags alone are not evidence of compatibility.
-Supply that launcher's own arguments rather than the TokenSpeed `SERVER_ARGS`
-above: option names are engine-specific. Custom launchers can also be called
-without extra arguments if they already obtain their settings from the environment.
-For a system-Python launcher set `SERVER_VENV=''` explicitly. Both launchers must
-declare `MODEL_DIR`, `DRAFT_DIR`, their immutable revisions, the effective
-`GPU_MEMORY_UTILIZATION` and `SERVER_SEED`, even when their command construction
-differs. Set scenario `engine_version` to the actual runtime revision/version.
+For vLLM comparisons, use the vLLM launcher separately with the same trace,
+scenario, duration, grace, root concurrency and cache-start protocol. This script
+selects the existing TokenSpeed configs; it does not accept an arbitrary engine
+launcher. Verify checkpoint, long-context and speculation support in the exact
+vLLM environment before comparing results.
 
 ## Evidence and acceptance
 
@@ -282,3 +273,18 @@ distinguish unfinished requests from a stalled drain. A longer grace period does
 not fix a stalled drain or guarantee zero cancellations. Preserve failed artifacts
 when changing the client or drain settings. This launcher does not patch client
 scheduling or recalculate its metrics.
+
+## Scenario consistency and timeout diagnosis
+
+The launcher captures the scenario JSON once before preparation. Manifest
+validation and the client consume that same shell value; editing the copied
+`scenario.json` during startup does not change the executed scenario. The
+validated `manifest.json.scenario` records its effective settings.
+
+Rejected grace-timeout audits include `drain_outcome`. The value
+`all_dispatched_requests_returned` requires a unique pre-cancellation timeout
+record with sent equal to completed, zero cancellations and zero in-flight
+requests. `requests_unfinished_or_cancelled` indicates outstanding or cancelled
+requests at timeout. Missing or ambiguous evidence produces `unknown_at_timeout`.
+All three remain rejected: returned HTTP requests alone do not prove normal
+session-tree completion. These classifications do not alter upstream metrics.

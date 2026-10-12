@@ -58,9 +58,7 @@ def server_configuration(environment):
 def prepare(run_root, server_arguments):
     from evalscope.perf.scenarios.agentx import AgentXScenario
 
-    scenario = AgentXScenario.model_validate_json(
-        (run_root / "scenario.json").read_text()
-    )
+    scenario = AgentXScenario.model_validate_json(os.environ["AGENTX_SCENARIO_JSON"])
     server = server_configuration(os.environ)
     duration = int(os.environ["DURATION"])
     if scenario.mode == "benchmark" and duration < 900:
@@ -86,7 +84,6 @@ def prepare(run_root, server_arguments):
             "READINESS_PATH",
             "READINESS_TIMEOUT",
             "CLIENT_TIMEOUT",
-            "HOLD_AFTER_RUN",
             "SLURM_JOB_ID",
         )
     }
@@ -134,6 +131,34 @@ def profiling_counts(log_text):
     ]
 
 
+def grace_outcome(log_text):
+    timed_out = bool(
+        re.search(
+            r"Phase profiling \(profiling\) complete[^\n]*grace_period_timeout=True",
+            log_text,
+        )
+    )
+    if not timed_out:
+        return {"grace_period_timeout": False, "drain_outcome": "not_timed_out"}
+    matches = re.findall(
+        r"Phase profiling timed out, cancelling all credits\. Stats: "
+        r"sent=(\d+), completed=(\d+), cancelled=(\d+), in_flight=(\d+)",
+        log_text,
+    )
+    result = {"grace_period_timeout": True, "drain_outcome": "unknown_at_timeout"}
+    if len(matches) != 1:
+        return result
+    counts = dict(
+        zip(("sent", "completed", "cancelled", "in_flight"), map(int, matches[0]))
+    )
+    result["requests_at_grace_timeout"] = counts
+    if counts["in_flight"] > 0 or counts["cancelled"] > 0:
+        result["drain_outcome"] = "requests_unfinished_or_cancelled"
+    elif counts["sent"] == counts["completed"]:
+        result["drain_outcome"] = "all_dispatched_requests_returned"
+    return result
+
+
 def audit(summary, records, log_text):
     if summary["status"] != "completed" or summary["error_summary"]:
         raise ValueError("Benchmark did not complete without reported errors")
@@ -159,13 +184,14 @@ def audit(summary, records, log_text):
     phases = profiling_counts(log_text)
     if len(phases) != 1:
         raise ValueError("Missing or ambiguous final profiling phase counts")
-    if re.search(
-        r"Phase profiling \(profiling\) complete[^\n]*grace_period_timeout=True",
-        log_text,
-    ):
-        raise ValueError(
-            "Profiling exhausted the grace period; throughput includes an incomplete drain"
-        )
+    drain = grace_outcome(log_text)
+    if drain["grace_period_timeout"]:
+        reasons = {
+            "all_dispatched_requests_returned": "Profiling phase timed out after all dispatched requests returned; phase completion requires investigation",
+            "requests_unfinished_or_cancelled": "Profiling exhausted the grace period with unfinished or cancelled requests",
+            "unknown_at_timeout": "Profiling exhausted the grace period; request state at timeout is unknown",
+        }
+        raise ValueError(reasons[drain["drain_outcome"]])
     completed, cancelled, errors = (
         phases[0][key] for key in ("completed", "cancelled", "errors")
     )
@@ -221,6 +247,7 @@ def main(operation, run_root, server_arguments):
             "cancelled": None,
             "errors": None,
             "profiling_phase_counts": phases,
+            **grace_outcome(log_text),
         }
         if len(phases) == 1:
             result.update(phases[0])
